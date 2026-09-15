@@ -1,0 +1,30 @@
+# Secrets — NE JAMAIS committer
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+/run/secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+
+# Node / front
+node_modules/
+dist/
+build/
+.vite/
+
+# Divers
+.DS_Store
+*.log
+.idea/
+.vscode/

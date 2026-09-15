@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-test:
+    name: lint & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Squelette CI
+        run: echo "CI prête. Ajouter lint/tests à mesure que le code arrive."
+      # Python (décommenter quand gateway/ ou api_pentest/ existent) :
+      # - uses: actions/setup-python@v5
+      #   with: { python-version: "3.12" }
+      # - run: pipx install ruff mypy
+      # - run: ruff check .
+      # - run: pytest
+      # Front (décommenter quand dashboard/ existe) :
+      # - uses: actions/setup-node@v4
+      #   with: { node-version: "20" }
+      # - run: cd dashboard && npm ci && npm run lint && npm test

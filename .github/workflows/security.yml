@@ -1,0 +1,28 @@
+name: security
+on:
+  push:
+  pull_request:
+
+jobs:
+  gitleaks:
+    name: gitleaks (détection de secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # NOTE : si le dépôt passe sous une ORGANISATION, l'action exige une
+          # licence gitleaks (gratuite). Ajouter alors :
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # À activer quand du code sera présent :
+  # sast:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: semgrep
+  #       run: pipx run semgrep scan --config auto --error
