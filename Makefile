@@ -32,5 +32,5 @@ seed-kb:       ## (Phase 2) Ingère la base de connaissances
 	@echo "TODO"
 seed-modules:  ## (B0.4) Charge le registre des modules
 	@echo "TODO"
-create-admin:  ## (B0.3) Crée le premier compte admin + MFA
-	@echo "TODO"
+create-admin:  ## Crée le premier compte admin (dans le conteneur gateway)
+	docker compose run --rm gateway python -m app.admin

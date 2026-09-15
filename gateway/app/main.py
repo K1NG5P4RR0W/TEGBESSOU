@@ -1,9 +1,8 @@
-"""TEGBESSOU API Gateway — B0.2.
+"""TEGBESSOU API Gateway — B0.3 (auth + RBAC).
 
-/health       : liveness (le process répond).
-/health/ready : readiness (PostgreSQL + Redis joignables).
-Les clients DB/Redis sont créés au démarrage mais ne se connectent qu'à l'usage,
-donc l'app démarre même si les dépendances sont momentanément indisponibles.
+/health       : liveness.
+/health/ready : readiness (PostgreSQL + Redis).
+/auth/*, /users : authentification et gestion des comptes.
 """
 
 from collections.abc import AsyncIterator
@@ -13,6 +12,8 @@ from typing import Any
 from fastapi import FastAPI, Response
 from sqlalchemy import text
 
+from app.api.auth import router as auth_router
+from app.api.users import router as users_router
 from app.core.db import make_engine, make_sessionmaker
 from app.core.redis_client import make_redis
 
@@ -30,7 +31,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await engine.dispose()
 
 
-app = FastAPI(title="TEGBESSOU API Gateway", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="TEGBESSOU API Gateway", version="0.3.0", lifespan=lifespan)
+app.include_router(auth_router)
+app.include_router(users_router)
 
 
 @app.get("/health")

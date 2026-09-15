@@ -12,6 +12,11 @@ dependencies = [
     "alembic>=1.13",
     "redis>=5.0",
     "pydantic-settings>=2.4",
+    "pydantic[email]>=2.9",
+    "argon2-cffi>=23.1",
+    "pyjwt[crypto]>=2.9",
+    "pyotp>=2.9",
+    "cryptography>=43.0",
 ]
 
 [dependency-groups]
@@ -33,6 +38,12 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "S"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Body",
+    "fastapi.Header", "app.api.deps.require_role",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106", "S107"]
