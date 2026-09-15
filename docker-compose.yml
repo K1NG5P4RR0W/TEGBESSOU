@@ -41,6 +41,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-tegbessou_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
       REDIS_URL: redis://redis:6379/0
+      TEGBESSOU_MASTER_KEY: ${TEGBESSOU_MASTER_KEY:-}
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:-}
+      REQUIRE_MFA: ${REQUIRE_MFA:-false}
     depends_on:
       postgres:
         condition: service_healthy
