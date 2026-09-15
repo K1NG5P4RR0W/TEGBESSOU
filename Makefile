@@ -1,5 +1,5 @@
 # Raccourcis de développement.
-.PHONY: up down logs ps lint test migrate revision health ready seed-kb seed-modules create-admin
+.PHONY: up down logs ps lint test migrate revision health ready seed-kb seed-modules create-admin reset-admin
 
 up:            ## Construit et démarre la stack (attend que la gateway soit "ready")
 	docker compose up -d --build
@@ -34,3 +34,5 @@ seed-modules:  ## (B0.4) Charge le registre des modules
 	@echo "TODO"
 create-admin:  ## Crée le premier compte admin (dans le conteneur gateway)
 	docker compose run --rm gateway python -m app.admin
+reset-admin:   ## Réinitialise le mot de passe admin
+	docker compose run --rm gateway python -m app.reset_password
