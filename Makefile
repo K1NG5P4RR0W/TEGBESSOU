@@ -1,7 +1,7 @@
-# Raccourcis de développement. `make up` construit et démarre la stack.
-.PHONY: up down logs ps lint test health migrate seed-kb seed-modules create-admin
+# Raccourcis de développement.
+.PHONY: up down logs ps lint test migrate revision health ready seed-kb seed-modules create-admin
 
-up:            ## Construit et démarre la stack de dev
+up:            ## Construit et démarre la stack (attend que la gateway soit "ready")
 	docker compose up -d --build
 down:          ## Arrête la stack
 	docker compose down
@@ -10,22 +10,27 @@ logs:          ## Suit les logs
 ps:            ## État des conteneurs
 	docker compose ps
 
-lint:          ## Lint + typage des deux services
-	cd gateway && uv run ruff check . && uv run mypy .
+lint:          ## Lint + typage
+	cd gateway && uv run ruff check . && uv run mypy app
 	cd api_pentest && uv run ruff check . && uv run mypy .
-test:          ## Tests des deux services
+test:          ## Tests
 	cd gateway && uv run pytest
 	cd api_pentest && uv run pytest
-health:        ## Vérifie les endpoints /health (stack démarrée)
+
+migrate:       ## Applique les migrations dans le conteneur gateway
+	docker compose run --rm gateway alembic upgrade head
+revision:      ## Crée une révision vide (usage : make revision m="message")
+	docker compose run --rm gateway alembic revision -m "$(m)"
+
+health:        ## /health des deux services
 	@curl -fsS http://127.0.0.1:8001/health && echo "  <- gateway OK"
 	@curl -fsS http://127.0.0.1:8000/health && echo "  <- api_pentest OK"
+ready:         ## /health/ready de la gateway (DB + Redis)
+	@curl -fsS http://127.0.0.1:8001/health/ready && echo
 
-# --- Cibles à implémenter dans les briques suivantes ---
-migrate:       ## (B0.2) Applique les migrations
-	@echo "TODO B0.2 : alembic upgrade head"
 seed-kb:       ## (Phase 2) Ingère la base de connaissances
 	@echo "TODO"
-seed-modules:  ## (B0.2) Charge le registre des modules
+seed-modules:  ## (B0.4) Charge le registre des modules
 	@echo "TODO"
 create-admin:  ## (B0.3) Crée le premier compte admin + MFA
 	@echo "TODO"
