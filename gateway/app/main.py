@@ -1,0 +1,15 @@
+"""TEGBESSOU API Gateway — squelette B0.1.
+
+Expose un endpoint de liveness /health. La vérification de disponibilité
+réelle (DB, Redis) via /health/ready arrivera en B0.2.
+"""
+
+from fastapi import FastAPI
+
+app = FastAPI(title="TEGBESSOU API Gateway", version="0.1.0")
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Liveness : le service répond."""
+    return {"status": "ok", "service": "gateway"}

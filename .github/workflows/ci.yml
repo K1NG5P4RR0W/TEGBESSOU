@@ -3,21 +3,28 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   lint-test:
     name: lint & tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Squelette CI
-        run: echo "CI prête. Ajouter lint/tests à mesure que le code arrive."
-      # Python (décommenter quand gateway/ ou api_pentest/ existent) :
-      # - uses: actions/setup-python@v5
-      #   with: { python-version: "3.12" }
-      # - run: pipx install ruff mypy
-      # - run: ruff check .
-      # - run: pytest
-      # Front (décommenter quand dashboard/ existe) :
-      # - uses: actions/setup-node@v4
-      #   with: { node-version: "20" }
-      # - run: cd dashboard && npm ci && npm run lint && npm test
+      - name: Installer uv
+        uses: astral-sh/setup-uv@v10.1.0
+      - name: gateway — lint, typage, tests
+        working-directory: gateway
+        run: |
+          uv sync
+          uv run ruff check .
+          uv run mypy .
+          uv run pytest
+      - name: api_pentest — lint, typage, tests
+        working-directory: api_pentest
+        run: |
+          uv sync
+          uv run ruff check .
+          uv run mypy .
+          uv run pytest
