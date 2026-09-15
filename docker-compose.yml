@@ -1,8 +1,8 @@
 name: tegbessou
 
-# Stack de DÉVELOPPEMENT. Ports liés à 127.0.0.1 uniquement (pas d'exposition
-# réseau). Le build local est OK sur le poste opérateur ; ne PAS builder sur un
-# hôte contraint en RAM (cf. docs/IMPLEMENTATION.md §4/§16).
+# Stack de DÉVELOPPEMENT. Ports liés à 127.0.0.1 uniquement.
+# Le build local est OK sur le poste opérateur ; pas de build sur un hôte
+# contraint en RAM (cf. docs/IMPLEMENTATION.md §4/§16).
 
 services:
   postgres:
@@ -49,6 +49,12 @@ services:
     ports:
       - "127.0.0.1:8001:8000"
     mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/ready').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   api_pentest:
     build: ./api_pentest
@@ -56,7 +62,7 @@ services:
       GATEWAY_INTERNAL_URL: http://gateway:8000
     depends_on:
       gateway:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"
     mem_limit: 512m
