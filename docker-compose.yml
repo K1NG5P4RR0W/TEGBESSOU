@@ -52,6 +52,8 @@ services:
     ports:
       - "127.0.0.1:8001:8000"
     mem_limit: 512m
+    volumes:
+      - authorizations:/data/authorizations
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/ready').status==200 else 1)"]
       interval: 10s
@@ -72,3 +74,4 @@ services:
 
 volumes:
   pgdata:
+  authorizations:

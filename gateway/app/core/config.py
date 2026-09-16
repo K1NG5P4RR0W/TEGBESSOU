@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # MFA TOTP : désactivée par défaut (usage local). À activer sur toute instance exposée.
     require_mfa: bool = False
 
+    # Coffre de fichiers (autorisations) — répertoire du volume + limite de taille
+    file_vault_dir: str = Field(default="/data/authorizations", validation_alias="FILE_VAULT_DIR")
+    max_upload_bytes: int = 10 * 1024 * 1024  # 10 Mo
+
     @property
     def async_dsn(self) -> str:
         return (
