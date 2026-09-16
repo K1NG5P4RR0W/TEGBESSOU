@@ -17,6 +17,7 @@ dependencies = [
     "pyjwt[crypto]>=2.9",
     "pyotp>=2.9",
     "cryptography>=43.0",
+    "python-multipart>=0.0.9",
 ]
 
 [dependency-groups]
@@ -43,7 +44,7 @@ select = ["E", "F", "I", "B", "UP", "S"]
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [
     "fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Body",
-    "fastapi.Header", "app.api.deps.require_role",
+    "fastapi.Header", "fastapi.File", "fastapi.Form", "app.api.deps.require_role",
 ]
 
 [tool.ruff.lint.per-file-ignores]

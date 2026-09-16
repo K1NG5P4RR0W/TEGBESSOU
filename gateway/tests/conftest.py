@@ -4,6 +4,10 @@ import os
 # Clé maître de test — définie avant tout import de l'application.
 os.environ.setdefault("TEGBESSOU_MASTER_KEY", base64.b64encode(b"0" * 32).decode())
 
+import tempfile  # noqa: E402
+
+os.environ.setdefault("FILE_VAULT_DIR", tempfile.mkdtemp())
+
 import pathlib  # noqa: E402
 import urllib.parse  # noqa: E402
 from collections.abc import AsyncIterator, Iterator  # noqa: E402
