@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.models.tables import Authorization, Engagement, ScopeEntry
 from app.security.audit import append_audit
 from app.security.scope import ScopeViolationError, enforce_scope
+from app.services.engagement_schema import drop_engagement_schema, provision_engagement_schema
 
 router = APIRouter(prefix="/engagements", tags=["engagements"])
 
@@ -274,9 +275,17 @@ async def activate_engagement(
     auth.validated_by = actor.id
     auth.validated_at = dt.datetime.now(tz=dt.UTC)
     eng.status = "active"
+    await provision_engagement_schema(session, eng.schema_name)
     await append_audit(
         session,
         action="engagement.activate",
+        actor_id=actor.id,
+        engagement_id=engagement_id,
+        target=eng.schema_name,
+    )
+    await append_audit(
+        session,
+        action="schema.provision",
         actor_id=actor.id,
         engagement_id=engagement_id,
         target=eng.schema_name,
@@ -313,3 +322,56 @@ async def check_target(
     except ScopeViolationError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     return CheckTargetOut(allowed=True, reason=decision.reason)
+
+
+@router.post("/{engagement_id}/close")
+async def close_engagement(
+    engagement_id: uuid.UUID,
+    actor: CurrentUser = Depends(require_role("lead")),
+    session: AsyncSession = Depends(get_session),
+) -> EngagementOut:
+    eng = await _get_engagement(session, engagement_id)
+    if eng.status == "closed":
+        raise HTTPException(status_code=409, detail="engagement déjà clos")
+    eng.status = "closed"
+    eng.closed_at = dt.datetime.now(tz=dt.UTC)
+    await append_audit(
+        session,
+        action="engagement.close",
+        actor_id=actor.id,
+        engagement_id=engagement_id,
+        target=eng.schema_name,
+    )
+    await session.commit()
+    return EngagementOut(
+        id=str(eng.id),
+        name=eng.name,
+        mode=eng.mode,
+        status=eng.status,
+        current_phase=eng.current_phase,
+    )
+
+
+@router.post("/{engagement_id}/purge")
+async def purge_engagement(
+    engagement_id: uuid.UUID,
+    actor: CurrentUser = Depends(require_role("admin")),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    """Suppression définitive des données de l'engagement (fin de mission).
+
+    Réservé admin ; l'engagement doit être clos au préalable.
+    """
+    eng = await _get_engagement(session, engagement_id)
+    if eng.status != "closed":
+        raise HTTPException(status_code=409, detail="l'engagement doit être clos avant purge")
+    await drop_engagement_schema(session, eng.schema_name)
+    await append_audit(
+        session,
+        action="schema.drop",
+        actor_id=actor.id,
+        engagement_id=engagement_id,
+        target=eng.schema_name,
+    )
+    await session.commit()
+    return {"status": "purged", "schema": eng.schema_name}
