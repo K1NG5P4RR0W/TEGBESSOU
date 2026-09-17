@@ -18,4 +18,4 @@ No contribution can be merged before its author appears in this file.
 
 | Name / Entity | GitHub handle | CLA version | Date |
 |---|---|---|---|
-| Fréjus | @K1NG5P4RR0W | 1.0 | 2026-01-01 |
+| @K1NG5P4RR0W | @K1NG5P4RR0W | 1.0 | 2026-01-01 |

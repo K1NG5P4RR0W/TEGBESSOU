@@ -3,7 +3,7 @@
 **Version 1.0**
 
 Thank you for your interest in contributing to TEGBESSOU (the "Project"),
-maintained by Fréjus (handle: K1NG5P4RR0W) under the brand **zeromisconfig**
+maintained by K1NG5P4RR0W under the brand **zeromisconfig**
 (the "Maintainer").
 
 This Contributor License Agreement ("Agreement") clarifies the intellectual
