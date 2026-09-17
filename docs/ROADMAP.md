@@ -23,7 +23,7 @@
 - **C3** `tegbessou scope add`, `authorize`, `activate`, `check-target`.
 > Dépend de : API (déjà livrée). **Autonome, démarrable tout de suite.**
 
-### Lane CŒUR — Exécution + 1er module RECON  · `track:execution` *(chemin critique, Fréjus)*
+### Lane CŒUR — Exécution + 1er module RECON  · `track:execution` *(chemin critique, K1NG5P4RR0W)*
 - **E0** ⚠️ **Design à valider ensemble AVANT de coder** : isolation d'exécution (worker sandboxé, egress contrôlé), file de jobs Redis.
 - **E1** Job Dispatcher + file Redis + un worker minimal.
 - **E2** Wrappers d'outils normalisés (subfinder, httpx) — *fonctions pures, testables seules* → peuvent être faites en Lane BACK en appoint · `track:tools`.
