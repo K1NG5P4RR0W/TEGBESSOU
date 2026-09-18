@@ -4,6 +4,14 @@ name: tegbessou
 # Le build local est OK sur le poste opérateur ; pas de build sur un hôte
 # contraint en RAM (cf. docs/IMPLEMENTATION.md §4/§16).
 
+# Deux réseaux Docker distincts (E1, docs/EXECUTION_DESIGN.md) :
+# - db_net    : postgres + gateway. Le worker n'y est JAMAIS raccordé.
+# - queue_net : redis + gateway + worker + api_pentest. C'est le seul réseau
+#               que le worker atteint : il ne peut pas router vers postgres.
+networks:
+  db_net:
+  queue_net:
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -16,6 +24,8 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     mem_limit: 512m
+    networks:
+      - db_net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tegbessou_app} -d ${POSTGRES_DB:-tegbessou}"]
       interval: 10s
@@ -27,6 +37,8 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     mem_limit: 256m
+    networks:
+      - queue_net
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -54,12 +66,37 @@ services:
     mem_limit: 512m
     volumes:
       - authorizations:/data/authorizations
+    networks:
+      - db_net
+      - queue_net
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/ready').status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
+
+  # Worker arq isolé (E1) — plomberie d'exécution, aucune cible réseau.
+  # Même image que la gateway ; commande + réseau + sandbox différents.
+  # PAS de variable POSTGRES_* : le worker ne connaît que Redis.
+  worker:
+    build: ./gateway
+    command: ["arq", "app.worker.WorkerSettings"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - queue_net
+    mem_limit: 256m
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
   api_pentest:
     build: ./api_pentest
@@ -71,6 +108,8 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     mem_limit: 512m
+    networks:
+      - queue_net
 
 volumes:
   pgdata:

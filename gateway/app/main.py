@@ -14,7 +14,9 @@ from sqlalchemy import text
 
 from app.api.auth import router as auth_router
 from app.api.engagements import router as engagements_router
+from app.api.tasks import router as tasks_router
 from app.api.users import router as users_router
+from app.core.arq_pool import make_arq_pool
 from app.core.db import make_engine, make_sessionmaker
 from app.core.redis_client import make_redis
 
@@ -25,9 +27,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.sessionmaker = make_sessionmaker(engine)
     app.state.redis = make_redis()
+    app.state.arq_pool = make_arq_pool()
     try:
         yield
     finally:
+        await app.state.arq_pool.aclose()
         await app.state.redis.aclose()
         await engine.dispose()
 
@@ -36,6 +40,7 @@ app = FastAPI(title="TEGBESSOU API Gateway", version="0.3.0", lifespan=lifespan)
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(engagements_router)
+app.include_router(tasks_router)
 
 
 @app.get("/health")
