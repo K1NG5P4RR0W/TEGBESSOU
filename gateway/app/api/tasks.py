@@ -113,6 +113,8 @@ async def enqueue_noop_task(
         params={"task_id": str(task_id)},
     )
     await session.commit()
+    # TODO(E3): réconcilier les tâches orphelines (ligne `queued` sans job arq)
+    # si le process meurt entre le commit et l’enqueue — balayage à ajouter.
     await arq_pool.enqueue_job("run_noop", args, body.timeout_seconds, _job_id=str(task_id))
     return TaskOut(id=str(task_id), tool="noop", target=body.command, status="queued")
 
