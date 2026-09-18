@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 import jwt as jwtlib
+from arq.connections import ArqRedis
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,11 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     maker = request.app.state.sessionmaker
     async with maker() as session:
         yield session
+
+
+async def get_arq_pool(request: Request) -> ArqRedis:
+    pool: ArqRedis = request.app.state.arq_pool
+    return pool
 
 
 async def get_current_user(

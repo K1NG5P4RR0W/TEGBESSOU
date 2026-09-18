@@ -26,7 +26,12 @@ class InvalidSchemaNameError(ValueError):
     pass
 
 
-def _validate(schema: str) -> str:
+def validate_schema_name(schema: str) -> str:
+    """Valide un nom de schéma `eng_<hex>` avant toute interpolation SQL.
+
+    Utilisé ici et par tout code qui doit écrire dans le schéma d'un engagement
+    (ex. le collecteur de résultats de tâches, B1.2/E1) sans passer par l'ORM.
+    """
     if not _SCHEMA_RE.match(schema):
         raise InvalidSchemaNameError(f"nom de schéma invalide : {schema!r}")
     return schema
@@ -107,12 +112,12 @@ ENGAGEMENT_TABLES = ("assets", "asset_edges", "tasks", "findings", "evidences", 
 
 async def provision_engagement_schema(session: AsyncSession, schema_name: str) -> None:
     """Crée le schéma de l'engagement et ses tables. Idempotent sur le schéma."""
-    _validate(schema_name)
+    validate_schema_name(schema_name)
     for statement in _ddl(schema_name):
         await session.execute(text(statement))
 
 
 async def drop_engagement_schema(session: AsyncSession, schema_name: str) -> None:
     """Supprime définitivement le schéma de l'engagement (suppression de fin de mission)."""
-    _validate(schema_name)
+    validate_schema_name(schema_name)
     await session.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
