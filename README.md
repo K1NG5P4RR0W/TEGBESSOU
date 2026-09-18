@@ -18,13 +18,6 @@ what makes it both more useful and legally defensible for authorized work.
 By design it enforces: mandatory authorization before any action, scope
 validation on every request, and an append-only, tamper-evident audit log.
 
-## Documentation
-
-- `docs/IMPLEMENTATION.md` — full implementation document (architecture, security, deployment).
-- `docs/AGENTS.md` — detailed agent and methodology specification.
-- `docs/EXECUTION_DESIGN.md` — execution-layer (sandboxing / egress) design.
-- `docs/ONBOARDING.md` — developer setup (get to a green `make test`).
-- `docs/ROADMAP.md`, `docs/ASSIGNMENTS.md`, `docs/DEFINITION_OF_DONE.md` — team coordination.
 
 ## Quick start (development)
 
