@@ -1,0 +1,35 @@
+.btn {
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.primary {
+  background: var(--accent);
+  color: var(--bg-inset);
+}
+.primary:hover {
+  background: var(--accent-hover);
+}
+.secondary {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text);
+}
+.secondary:hover {
+  background: var(--bg-elevated);
+}
+.danger {
+  background: var(--danger);
+  color: #ffffff;
+}
