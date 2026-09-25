@@ -4,13 +4,32 @@ name: tegbessou
 # Le build local est OK sur le poste opérateur ; pas de build sur un hôte
 # contraint en RAM (cf. docs/IMPLEMENTATION.md §4/§16).
 
-# Deux réseaux Docker distincts (E1, docs/EXECUTION_DESIGN.md) :
-# - db_net    : postgres + gateway. Le worker n'y est JAMAIS raccordé.
-# - queue_net : redis + gateway + worker + api_pentest. C'est le seul réseau
-#               que le worker atteint : il ne peut pas router vers postgres.
+# Réseaux Docker (E1 + E3a, docs/EXECUTION_DESIGN.md, docs/E3_EGRESS_DESIGN.md) :
+# - db_net     : postgres + gateway. Le worker n'y est JAMAIS raccordé.
+# - queue_net  : redis + gateway + api_pentest. Le worker n'y est PLUS
+#                raccordé depuis E3a (voir worker_net ci-dessous).
+# - worker_net : worker + redis (rattaché en plus) + egress-gateway.
+#                `internal: true` => aucune route NAT vers Internet créée par
+#                Docker pour ce réseau : même la route par défaut que Docker
+#                assigne automatiquement (le bridge lui-même) ne mène nulle
+#                part hors de ce sous-réseau. Le service worker-netinit
+#                (partage le netns du worker, NET_ADMIN le temps d'une
+#                commande puis s'arrête) réécrit la route par défaut du
+#                worker pour qu'elle pointe explicitement vers l'IP statique
+#                d'egress-gateway — sans jamais donner NET_ADMIN au worker
+#                lui-même. Le worker garde son accès Redis (même sous-réseau
+#                => connexion directe, pas de passage par la passerelle).
+# - egress_net : uplink Internet réel (NAT Docker normal), UNIQUEMENT pour
+#                egress-gateway — jamais pour le worker.
 networks:
   db_net:
   queue_net:
+  worker_net:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.90.0.0/24
+  egress_net:
 
 services:
   postgres:
@@ -38,7 +57,9 @@ services:
       - "127.0.0.1:6379:6379"
     mem_limit: 256m
     networks:
-      - queue_net
+      queue_net: {}
+      worker_net:
+        ipv4_address: 10.90.0.3
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -76,19 +97,31 @@ services:
       retries: 10
       start_period: 30s
 
-  # Worker arq isolé (E1) — plomberie d'exécution, aucune cible réseau.
+  # Worker arq isolé (E1, egress sandboxé depuis E3a).
   # Même image que la gateway ; commande + réseau + sandbox différents.
   # PAS de variable POSTGRES_* : le worker ne connaît que Redis.
+  # Réseau : worker_net UNIQUEMENT (internal: true). Sa route par défaut est
+  # réécrite par worker-netinit vers egress-gateway ; il n'a AUCUNE route
+  # Internet directe. Redis reste joignable en direct (même sous-réseau).
   worker:
     build: ./gateway
     command: ["arq", "app.worker.WorkerSettings"]
     environment:
       REDIS_URL: redis://redis:6379/0
+    # Le résolveur DNS interne de Docker (127.0.0.11) refuse de transiter les
+    # requêtes externes sur un réseau internal:true (anti-exfiltration côté
+    # Docker) : le worker utilise donc directement le résolveur contrôlé de
+    # la passerelle pour tout nom (interne comme externe) — cohérent avec
+    # "DNS autorisé uniquement vers un résolveur contrôlé".
+    dns:
+      - 10.90.0.2
     depends_on:
       redis:
         condition: service_healthy
+      egress-gateway:
+        condition: service_healthy
     networks:
-      - queue_net
+      - worker_net
     mem_limit: 256m
     read_only: true
     tmpfs:
@@ -97,6 +130,66 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+  # Réécrit UNE FOIS la route par défaut du worker vers egress-gateway, puis
+  # s'arrête. Partage le netns du worker (network_mode) : NET_ADMIN reste sur
+  # ce conteneur jetable, jamais sur le worker lui-même (qui garde
+  # cap_drop: ALL en permanence). Aucun accès DB/secret, pas de volume,
+  # aucun code applicatif — seulement iproute2.
+  worker-netinit:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - "ip route replace default via 10.90.0.2"
+    network_mode: "service:worker"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      worker:
+        condition: service_started
+      egress-gateway:
+        condition: service_healthy
+    restart: "no"
+
+  # Passerelle d'egress (E3a) — sidecar sandboxé. Seule sortie réseau du
+  # worker. Deny-par-défaut : nftables (L3/L4 + redirection locale du DNS et
+  # du HTTP(S)) + nginx (filtrage par nom d'hôte — Host en HTTP, SNI en
+  # HTTPS — SANS déchiffrement TLS, aucune CA injectée) + dnsmasq (résolveur
+  # DNS contrôlé). Toute connexion refusée est journalisée avec sa
+  # destination (voir egress-gateway/README.md).
+  # Aucun accès DB/secret : pas de variable POSTGRES_*/TEGBESSOU_MASTER_KEY.
+  egress-gateway:
+    build: ./egress-gateway
+    environment:
+      WORKER_NET_SUBNET: 10.90.0.0/24
+      EGRESS_POLICY_FILE: /etc/egress/policy/allowlist-test.conf
+    volumes:
+      - ./egress-gateway/policy:/etc/egress/policy:ro
+    networks:
+      worker_net:
+        ipv4_address: 10.90.0.2
+      egress_net: {}
+    mem_limit: 128m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.ipv4.ip_forward: 1
+    healthcheck:
+      test: ["CMD", "nft", "list", "table", "inet", "egress"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   api_pentest:
     build: ./api_pentest
