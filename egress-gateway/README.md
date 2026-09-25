@@ -86,6 +86,31 @@ socket.create_connection(('postgres', 5432), timeout=3)" # doit échouer (régre
 docker compose exec worker env | grep -i postgres        # doit être vide
 ```
 
+## Fail-closed : fenêtre de démarrage et échec de worker-netinit
+
+**Garantie : le worker ne récupère jamais de route permissive.** Deux cas
+vérifiés (voir la session de dev pour les commandes exactes) :
+
+1. **Avant que `worker-netinit` ait tourné** — Docker n'installe **aucune
+   route par défaut** sur un réseau `internal: true` (ni la sienne, ni celle
+   d'un tiers) : `cat /proc/net/route` dans le worker ne montre que la route
+   de sous-réseau local, pas de ligne `0.0.0.0`. Une tentative de connexion
+   externe échoue immédiatement avec `OSError: Network is unreachable` —
+   rejetée par le noyau, aucun paquet n'est émis. Il n'y a donc pas de
+   fenêtre permissive : c'est fail-closed par défaut, pas par notre
+   configuration.
+2. **Si `worker-netinit` échoue** (testé avec une passerelle invalide/hors
+   sous-réseau) — `ip route replace` est atomique : un échec ne laisse
+   **aucune** entrée de route, la table reste inchangée (donc toujours
+   aucune route par défaut). Le worker reste bloqué à l'identique du cas 1.
+   `worker-netinit` a `restart: "no"` : un échec est **terminal et visible**
+   (`docker compose ps` montre `Exited (>0)`, pas de nouvelle tentative
+   automatique) — le worker reste sans egress tant que l'opérateur n'a pas
+   corrigé et relancé `docker compose up -d worker-netinit`. C'est un choix
+   délibéré : en cas de doute sur l'état de la route, le worker doit rester
+   injoignable plutôt que de retomber sur un comportement par défaut
+   (silencieusement fail-open serait le risque inverse).
+
 ## Limites connues (honnêtes, pour E3a)
 
 - **DNS non filtré par nom** : le résolveur contrôlé (`dnsmasq`) résout
