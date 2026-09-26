@@ -16,8 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.tables import User
 from app.security import tokens
-from app.security.audit import verify_chain
+from app.security.audit import append_audit, verify_chain
 from app.security.passwords import hash_password
+from app.services.execution import create_queued_task
 from tests.conftest import _fake_arq_pool
 
 
@@ -292,6 +293,192 @@ async def test_subfinder_task_persists_discovered_assets(
         assert r["kind"] == "subdomain"
         assert r["discovered_by"] == "subfinder"
         assert r["in_scope"] is True
+
+
+async def test_orphaned_queued_task_marked_failed_on_poll(
+    client: AsyncClient, session: AsyncSession
+) -> None:
+    """Simule le crash visé par les 2 anciens TODO(E3) : la ligne `tasks` est
+    commitée `queued` mais AUCUN job arq n'est jamais mis en file (process mort
+    entre le commit et l'enqueue). Le poll doit détecter l'absence de job
+    (`JobStatus.not_found`) et clore la tâche en échec plutôt que la laisser
+    coincée indéfiniment."""
+    token = await _lead_token(session)
+    eid = await _create_active_engagement(client, token)
+    schema = await session.scalar(
+        text("SELECT schema_name FROM engagements WHERE id = :id"), {"id": uuid.UUID(eid)}
+    )
+    task_id = uuid.uuid4()
+    await create_queued_task(
+        session,
+        schema,
+        task_id=task_id,
+        phase="recon",
+        tool="noop",
+        target="echo",
+        args_json={"args": ["/bin/echo", "orphan"], "timeout_seconds": 5.0},
+    )
+    await append_audit(
+        session,
+        action="task.enqueue",
+        engagement_id=uuid.UUID(eid),
+        target="echo",
+        params={"task_id": str(task_id)},
+    )
+    await session.commit()
+    # Volontairement : aucun arq_pool.enqueue_job ici — c'est exactement le
+    # trou laissé par les TODO(E3).
+
+    poll = await client.get(f"/engagements/{eid}/tasks/{task_id}", headers=_auth(token))
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "failed"
+
+    row = (
+        (
+            await session.execute(
+                text(
+                    "SELECT action, params_json FROM audit_log "
+                    "WHERE engagement_id = :eid AND action = 'task.run' "
+                    "ORDER BY ts DESC LIMIT 1"
+                ),
+                {"eid": uuid.UUID(eid)},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    assert row is not None
+    assert row["params_json"]["reason"] == "orphaned"
+    assert row["params_json"]["status"] == "failed"
+
+    assert await verify_chain(session) is True
+
+
+async def test_queued_task_still_in_flight_is_not_marked_failed(
+    client: AsyncClient, session: AsyncSession
+) -> None:
+    """Contre-épreuve : un job réellement en file (pas encore consommé par un
+    worker) ne doit jamais être confondu avec une tâche orpheline."""
+    token = await _lead_token(session)
+    eid = await _create_active_engagement(client, token)
+
+    enq = await client.post(
+        f"/engagements/{eid}/tasks/noop",
+        headers=_auth(token),
+        json={"command": "sleep", "seconds": 1},
+    )
+    assert enq.status_code == 201, enq.text
+    task_id = enq.json()["id"]
+
+    # Pas de run_worker() ici : le job existe dans la file mais n'a pas encore
+    # été ramassé par un worker.
+    poll = await client.get(f"/engagements/{eid}/tasks/{task_id}", headers=_auth(token))
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "queued"
+
+    assert await verify_chain(session) is True
+
+
+async def run_httpx(
+    ctx: dict[str, object], args: list[str], timeout_seconds: float = 30.0
+) -> dict[str, object]:
+    """Remplace le binaire réel dans les tests : sortie httpx d'exemple, jamais
+    de réseau. Fonction de MODULE (arq enregistre le job sous ce nom)."""
+    return {
+        "status": "done",
+        "stdout": (
+            '{"url":"https://example.com","host":"example.com","status_code":200,'
+            '"title":"Example Domain","webserver":"ECS"}\n'
+        ),
+        "exit_code": 0,
+        "duration_ms": 1,
+    }
+
+
+async def test_httpx_enqueue_out_of_scope_is_403_and_audited(
+    client: AsyncClient, session: AsyncSession
+) -> None:
+    token = await _lead_token(session)
+    eid = await _create_active_engagement(client, token)
+    # Aucune règle in_scope pour cet hôte : default deny.
+    enq = await client.post(
+        f"/engagements/{eid}/tasks/httpx",
+        headers=_auth(token),
+        json={"target": "hors-scope.example"},
+    )
+    assert enq.status_code == 403
+
+    assert await verify_chain(session) is True
+    row = (
+        (
+            await session.execute(
+                text(
+                    "SELECT action, target FROM audit_log "
+                    "WHERE engagement_id = :eid AND action = 'scope.violation' "
+                    "ORDER BY ts DESC LIMIT 1"
+                ),
+                {"eid": uuid.UUID(eid)},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    assert row is not None
+    assert row["target"] == "hors-scope.example"
+
+
+async def test_httpx_task_persists_discovered_assets(
+    client: AsyncClient,
+    session: AsyncSession,
+    fake_redis_server: object,
+) -> None:
+    """Parsing + persistance (E3 final), testables hors réseau : le job arq
+    est ici une sortie httpx d'exemple, jamais le binaire réel ni un accès
+    réseau — la preuve réseau réelle (sas/allowlist A) se fait en runtime
+    Docker (voir egress-gateway/README.md et la PR)."""
+    token = await _lead_token(session)
+    eid = await _create_active_engagement(client, token)
+    await _add_scope(client, token, eid, kind="domain", value="example.com", disposition="in_scope")
+
+    enq = await client.post(
+        f"/engagements/{eid}/tasks/httpx",
+        headers=_auth(token),
+        json={"target": "example.com"},
+    )
+    assert enq.status_code == 201, enq.text
+    task_id = enq.json()["id"]
+
+    worker_redis = _fake_arq_pool(fake_redis_server)
+    w = arq_worker.Worker(
+        functions=[run_httpx], redis_pool=worker_redis, burst=True, poll_delay=0.05
+    )
+    await w.async_run()
+    await worker_redis.aclose()
+
+    poll = await client.get(f"/engagements/{eid}/tasks/{task_id}", headers=_auth(token))
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "done"
+
+    schema = await session.scalar(
+        text("SELECT schema_name FROM engagements WHERE id = :id"), {"id": uuid.UUID(eid)}
+    )
+    rows = (
+        (
+            await session.execute(
+                text(f'SELECT value, kind, discovered_by, in_scope FROM "{schema}".assets'),  # noqa: S608
+            )
+        )
+        .mappings()
+        .all()
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["value"] == "https://example.com"
+    assert row["kind"] == "host"
+    assert row["discovered_by"] == "httpx"
+    assert row["in_scope"] is True
+
+    assert await verify_chain(session) is True
 
 
 async def test_worker_imports_no_database_driver() -> None:

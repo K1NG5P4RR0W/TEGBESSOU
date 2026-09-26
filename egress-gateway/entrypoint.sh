@@ -16,15 +16,26 @@ mkdir -p /var/log/egress /etc/nginx/generated
 # --- 1. Génération des maps nginx depuis la politique -----------------------
 # Le worker n'a ni accès réseau ni accès disque à ce fichier : c'est la
 # passerelle (et elle seule) qui lit la politique et matérialise les règles.
+#
+# EGRESS_POLICY_FILE peut lister PLUSIEURS fichiers séparés par ':' (chaque
+# fichier reste une allowlist statique, versionnée, revue séparément) : c'est
+# ainsi que l'allowlist B (OSINT, subfinder) et l'allowlist A (cible in-scope,
+# httpx) sont chargées ENSEMBLE dans ce sas unique — union des hôtes, mais
+# toujours deny-par-défaut pour tout le reste (voir docs/E3_EGRESS_DESIGN.md
+# §6 et egress-gateway/README.md pour la limite : une seule politique pour
+# tout le stack, pas encore une par engagement — génération dynamique = B5).
 : > /etc/nginx/generated/allowed_hosts.map
 : > /etc/nginx/generated/allowed_tls_upstreams.map
-while IFS= read -r host; do
-    host="${host%%#*}"
-    host="$(echo -n "$host" | tr -d '[:space:]')"
-    [ -z "$host" ] && continue
-    echo "${host} 1;" >> /etc/nginx/generated/allowed_hosts.map
-    echo "${host} ${host}:443;" >> /etc/nginx/generated/allowed_tls_upstreams.map
-done < "$EGRESS_POLICY_FILE"
+IFS=':' read -ra _policy_files <<< "$EGRESS_POLICY_FILE"
+for _policy_file in "${_policy_files[@]}"; do
+    while IFS= read -r host; do
+        host="${host%%#*}"
+        host="$(echo -n "$host" | tr -d '[:space:]')"
+        [ -z "$host" ] && continue
+        echo "${host} 1;" >> /etc/nginx/generated/allowed_hosts.map
+        echo "${host} ${host}:443;" >> /etc/nginx/generated/allowed_tls_upstreams.map
+    done < "$_policy_file"
+done
 
 echo "[egress-gateway] politique chargée depuis ${EGRESS_POLICY_FILE} :"
 sed 's/^/[egress-gateway]   allow /' /etc/nginx/generated/allowed_hosts.map

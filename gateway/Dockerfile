@@ -1,8 +1,8 @@
 # Base commune : dépendances Python + code applicatif, PAS d'outil offensif.
 # Deux images en découlent (stages `gateway` et `worker`) : même source, mêmes
-# dépendances non dupliquées, mais les outils offensifs (subfinder ici,
-# httpx/nmap plus tard) ne vivent QUE dans le stage `worker`. La gateway est
-# le composant exposé (base + secrets) : elle ne doit contenir aucun binaire
+# dépendances non dupliquées, mais les outils offensifs (subfinder, httpx —
+# nmap plus tard) ne vivent QUE dans le stage `worker`. La gateway est le
+# composant exposé (base + secrets) : elle ne doit contenir aucun binaire
 # offensif, même inutilisé.
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS base
 WORKDIR /app
@@ -37,6 +37,18 @@ ENV SUBFINDER_VERSION=${SUBFINDER_VERSION} SUBFINDER_SHA256=${SUBFINDER_SHA256}
 USER root
 COPY scripts/install_subfinder.py /tmp/install_subfinder.py
 RUN python3 /tmp/install_subfinder.py && rm /tmp/install_subfinder.py
+
+# httpx épinglé (pas "latest") + vérification d'intégrité par sha256 — même
+# patron que subfinder ci-dessus. httpx est du trafic ACTIF (il touche la
+# cible in-scope de l'engagement, allowlist A du sas — pas l'allowlist B des
+# sources OSINT) : voir app/wrappers/httpx.py et
+# egress-gateway/policy/allowlist-target-test.conf.
+ARG HTTPX_VERSION=1.12.0
+ARG HTTPX_SHA256=9d8439e8b6c9aa7d1e2314817a392e00d5178da3af5652f7475f88868f418f76
+ENV HTTPX_VERSION=${HTTPX_VERSION} HTTPX_SHA256=${HTTPX_SHA256}
+
+COPY scripts/install_httpx.py /tmp/install_httpx.py
+RUN python3 /tmp/install_httpx.py && rm /tmp/install_httpx.py
 
 # subfinder v2.16.0 refuse de démarrer si son fichier de configuration des
 # flags n'existe PAS (il n'utilise pas silencieusement des valeurs par défaut

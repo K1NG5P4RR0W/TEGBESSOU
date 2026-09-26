@@ -41,14 +41,40 @@ docker compose restart egress-gateway
 - `policy/allowlist-test.conf` : allowlist de TEST (E3a), `example.com` — sert
   aux vérifications manuelles de la barrière ci-dessous, à vide de tout outil
   réel.
-- `policy/allowlist-osint.conf` : **allowlist B réelle (E3b)**, en usage par
-  défaut (`EGRESS_POLICY_FILE` dans `docker-compose.yml`). Les 8 sources
-  passives fixes de subfinder, sans clé API — voir ce fichier pour la
-  correspondance exacte source → endpoint (vérifiée contre le code source de
-  subfinder v2.16.0, pas supposée) et les sources volontairement exclues.
+- `policy/allowlist-osint.conf` : **allowlist B (E3b)**, sources passives fixes
+  de subfinder, sans clé API — voir ce fichier pour la correspondance exacte
+  source → endpoint (vérifiée contre le code source de subfinder v2.16.0, pas
+  supposée) et les sources volontairement exclues.
+- `policy/allowlist-target-test.conf` : **allowlist A de TEST (E3 final)**,
+  `example.com` — la cible in-scope pour httpx (trafic ACTIF). Voir
+  « Mécanisme de l'allowlist A » ci-dessous.
 
-L'allowlist A (cibles in-scope résolues, pour le trafic actif — httpx,
-ensuite) reste hors périmètre d'E3a/E3b — voir `docs/E3_EGRESS_DESIGN.md` §6.
+`EGRESS_POLICY_FILE` (dans `docker-compose.yml`) charge les deux fichiers
+**ensemble**, séparés par `:` — c'est `entrypoint.sh` qui fusionne les hôtes
+des deux dans les mêmes maps nginx. Toujours un seul sas, une seule politique
+pour tout le stack ; tout hôte absent des deux fichiers reste refusé
+(deny-par-défaut inchangé).
+
+## Mécanisme de l'allowlist A (cibles in-scope, E3 final)
+
+Contrairement à l'allowlist B (sources OSINT, curée une fois pour toutes),
+l'allowlist A devrait en théorie suivre le scope de CHAQUE engagement,
+résolu dynamiquement à l'activation (voir `docs/E3_EGRESS_DESIGN.md` §6).
+Cette PR ne construit **pas** ce mécanisme dynamique : `allowlist-target-test.conf`
+est un fichier **statique**, au même patron que `allowlist-osint.conf`,
+contenant la cible du scénario de démonstration (`example.com`). C'est un
+scaffolding de preuve — il prouve que httpx sort bien par l'allowlist A côté
+sas, pas que l'allowlist A se régénère automatiquement par engagement.
+
+La génération dynamique par engagement (résoudre le scope actif, pousser la
+politique résultante à la passerelle — fichier régénéré + `docker compose
+restart egress-gateway`, ou une future API interne) reste explicitement hors
+périmètre, tracée comme itération séparée (B5, cf. §6/§10 du design doc) —
+pas traitée ici. Ne pas confondre : le Scope Enforcer applicatif (barrière 1,
+toujours actif, cf. plus bas) refuse déjà toute cible hors scope AVANT la
+mise en file ; l'allowlist A statique de cette PR est la barrière 2 (réseau),
+volontairement restreinte à la seule cible de démonstration pour ne pas
+élargir le sas au-delà du strict nécessaire.
 
 ## Lire les logs de refus
 
@@ -155,6 +181,88 @@ que ce soit un échec de la barrière (c'est le contenu OSINT qui varie, pas le
 filtrage réseau) — ce qui compte pour la preuve E3b est l'absence de refus
 dans les logs du sas pour les 8 hôtes de l'allowlist B, pas le nombre exact de
 sous-domaines trouvés.
+
+## Vérifier httpx à travers le sas (E3 final)
+
+Preuve de bout en bout : scope → enqueue → worker → sas d'egress (allowlist A,
+cible de TEST) → résultat → persistance (assets `kind=host`) → audit. Suite
+directe du scénario subfinder ci-dessus (même engagement, ou un nouveau).
+
+```
+TOKEN=$(curl -s -X POST http://127.0.0.1:8001/auth/login -H "Content-Type: application/json" \
+  -d '{"email":"<ADMIN_EMAIL>","password":"<ADMIN_PASSWORD>"}' | jq -r .access_token)
+
+EID=$(curl -s -X POST http://127.0.0.1:8001/engagements -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name":"e3-final","mode":"ctf"}' | jq -r .id)
+curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/authorization" -H "Authorization: Bearer $TOKEN" \
+  -F source_kind=program_url -F program_url=https://p/rules
+curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/activate" -H "Authorization: Bearer $TOKEN"
+# La cible in-scope DOIT être la même que l'allowlist A de test
+# (policy/allowlist-target-test.conf) pour que le job sorte réellement du sas.
+curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/scope" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"kind":"domain","value":"example.com","disposition":"in_scope"}'
+
+# 1. Job httpx réel sur la cible in-scope == cible de l'allowlist A.
+TID=$(curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/tasks/httpx" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"target":"example.com"}' | jq -r .id)
+
+sleep 10
+curl -s "http://127.0.0.1:8001/engagements/$EID/tasks/$TID" -H "Authorization: Bearer $TOKEN"
+# -> {"status":"done", ...}
+
+# 2. httpx a bien contacté example.com par le sas, aucun refus loggé pour cet hôte.
+docker compose logs egress-gateway | grep -i "example.com" | grep -viE "deny|403"
+docker compose logs egress-gateway | grep -iE "deny|403" | grep -i "example.com"
+# -> ne doit rien renvoyer.
+
+# 3. L'hôte vivant est persisté en assets (kind=host, discovered_by=httpx) + audit task.run.
+SCHEMA=$(docker compose exec -T postgres psql -U ${POSTGRES_USER:-tegbessou_app} \
+  -d ${POSTGRES_DB:-tegbessou} -tAc "SELECT schema_name FROM engagements WHERE id='$EID'")
+docker compose exec -T postgres psql -U ${POSTGRES_USER:-tegbessou_app} -d ${POSTGRES_DB:-tegbessou} \
+  -c "SELECT kind, value, discovered_by FROM \"$SCHEMA\".assets;"
+# -> kind=host, discovered_by=httpx, value contient example.com
+
+# 4. Scope enforcé : cible hors scope refusée avant même la mise en file.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://127.0.0.1:8001/engagements/$EID/tasks/httpx" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"target":"hors-scope.example"}'
+# -> 403 (+ ligne audit "scope.violation")
+
+# 5. Le sas ne fait PAS confiance au seul scope applicatif : même en mettant
+# artificiellement une cible in-scope QUI N'EST PAS dans l'allowlist A de
+# test, le job doit rester bloqué au niveau réseau (timeout/échec du poll, ou
+# `failed` selon le comportement de httpx sur une connexion refusée).
+curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/scope" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"kind":"domain","value":"example.org","disposition":"in_scope"}'
+TID2=$(curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/tasks/httpx" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"target":"example.org"}' | jq -r .id)
+sleep 10
+curl -s "http://127.0.0.1:8001/engagements/$EID/tasks/$TID2" -H "Authorization: Bearer $TOKEN"
+# -> httpx échoue à se connecter (hôte hors allowlist A) : la tâche ne persiste aucun asset.
+docker compose logs egress-gateway | grep -i "example.org"   # refus loggé (SNI/Host)
+
+# 6. Étanchéité des deux allowlists chargées ensemble : subfinder n'atteint
+# QUE les 8 sources OSINT (allowlist B), jamais example.com (allowlist A) ;
+# httpx n'atteint QUE la cible donnée (ici example.com), jamais une source
+# OSINT. Ce n'est pas une propriété du sas seul (les deux hôtes sont
+# effectivement autorisés par la politique combinée) mais de la commande
+# construite par chaque wrapper : `SubfinderWrapper.build_args` ne passe
+# jamais `-u example.com`, `HttpxWrapper.build_args` ne référence jamais les
+# hôtes OSINT. Le job subfinder de la section précédente (E3b) reste
+# reproductible ici sans régression :
+docker compose logs egress-gateway | grep -c "example.com"    # > 0 (httpx, cette section)
+docker compose logs egress-gateway | grep -iE \
+  "api.hackertarget.com|rapiddns.io|anubisdb.com|www.sitedossier.com|web.archive.org|certificatedetails.com|index.commoncrawl.org|api.sub.md" \
+  | grep -c "example.com"                                      # -> 0 : aucune ligne ne mélange les deux
+
+# 7. Régression E1/E3a/E3b : le worker n'a toujours aucun accès direct DB/Internet.
+docker compose exec worker python3 -c "
+import socket
+socket.create_connection(('postgres', 5432), timeout=3)" # doit échouer
+docker compose exec worker env | grep -i postgres         # doit être vide
+```
 
 ## Limites connues (honnêtes, pour E3a)
 
