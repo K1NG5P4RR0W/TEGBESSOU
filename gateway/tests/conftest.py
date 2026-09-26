@@ -35,6 +35,7 @@ from alembic import command  # noqa: E402
 
 GATEWAY_DIR = pathlib.Path(__file__).resolve().parent.parent
 
+
 # fakeredis n'implémente pas INFO ; arq l'appelle sans condition au démarrage
 # du worker. Neutralisé ici pour les tests uniquement (pure log, pas de logique).
 async def _noop_log_redis_info(redis: object, log_func: object) -> None:

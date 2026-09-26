@@ -1,13 +1,16 @@
-"""Worker arq isolé — E1 : plomberie d'exécution, aucune cible réseau.
+"""Worker arq isolé — E1 (plomberie) + E3b (subfinder réel).
 
 Ce worker ne connaît QUE Redis (pas de credentials PostgreSQL, pas de secret).
-Il exécute une commande locale triviale et sûre via un tableau d'arguments
-typé (jamais `shell=True`), la normalise, et renvoie le résultat à la gateway
-via le résultat du job arq. C'est la gateway (voir `app/services/execution.py`)
-qui persiste en base et journalise — le worker n'écrit jamais en base.
+Il exécute une commande via un tableau d'arguments typé (jamais `shell=True`),
+la normalise, et renvoie le résultat à la gateway via le résultat du job arq.
+C'est la gateway (voir `app/services/execution.py`) qui persiste en base et
+journalise — le worker n'écrit jamais en base.
 
-E2/E3 brancheront ici les vrais wrappers d'outils (subfinder, httpx…) derrière
-le même contrat de sortie normalisée.
+`run_noop` (E1) n'ouvre aucun réseau externe. `run_subfinder` (E3b) exécute le
+premier outil qui sort réellement vers le réseau — via le sas d'egress (E3a),
+jamais en direct (le worker n'a aucune route Internet directe). Les deux
+tâches partagent le même modèle d'exécution (`_run_subprocess`) : timeout +
+kill switch identiques.
 """
 
 from __future__ import annotations
@@ -37,15 +40,16 @@ async def _watch_cancel(redis: Redis, key: str) -> None:
         await asyncio.sleep(_CANCEL_POLL_SECONDS)
 
 
-async def run_noop(
-    ctx: dict[str, Any], args: list[str], timeout_seconds: float = 5.0
+async def _run_subprocess(
+    ctx: dict[str, Any], args: list[str], timeout_seconds: float
 ) -> dict[str, Any]:
-    """Exécute une commande sûre (args typés) et renvoie un résultat normalisé.
+    """Exécute une commande (args typés) et renvoie un résultat normalisé.
 
     Résultat : {status, stdout, exit_code, duration_ms}. status ∈
     {done, failed, killed}. Surveille en parallèle le kill switch posé par la
-    gateway dans Redis (clé `job:cancel:<job_id>`), sans jamais accéder à la
-    base ni au réseau externe.
+    gateway dans Redis (clé `job:cancel:<job_id>`). Ne touche jamais la base ;
+    le réseau éventuellement ouvert par `args` passe par le sas d'egress (E3a),
+    jamais en direct — le worker n'a aucune route Internet propre.
     """
     redis: Redis = ctx["redis"]
     job_id: str = str(ctx["job_id"])
@@ -89,9 +93,28 @@ async def run_noop(
         await redis.delete(key)
 
 
+async def run_noop(
+    ctx: dict[str, Any], args: list[str], timeout_seconds: float = 5.0
+) -> dict[str, Any]:
+    """E1 : commande locale triviale et sûre, aucun réseau externe."""
+    return await _run_subprocess(ctx, args, timeout_seconds)
+
+
+async def run_subfinder(
+    ctx: dict[str, Any], args: list[str], timeout_seconds: float = 60.0
+) -> dict[str, Any]:
+    """E3b : exécute la commande produite par `SubfinderWrapper.build_args`.
+
+    Même modèle que `run_noop` (timeout + kill switch). La sortie brute
+    (JSON lines) est renvoyée telle quelle ; c'est la gateway qui la parse
+    (`SubfinderWrapper.parse`) et persiste les sous-domaines découverts.
+    """
+    return await _run_subprocess(ctx, args, timeout_seconds)
+
+
 class WorkerSettings:
-    functions = (run_noop,)
+    functions = (run_noop, run_subfinder)
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 4
-    job_timeout = 30
+    job_timeout = 90
     allow_abort_jobs = True

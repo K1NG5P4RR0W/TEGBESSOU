@@ -1,7 +1,7 @@
 import pytest
 
 from app.wrappers.base import WrapperResult
-from app.wrappers.subfinder import InvalidTargetError, SubfinderWrapper
+from app.wrappers.subfinder import PASSIVE_SOURCES, InvalidTargetError, SubfinderWrapper
 
 # Sortie JSON lines réaliste de subfinder, avec pièges : doublon, ligne vide,
 # ligne non-JSON, objet sans "host", casse mixte.
@@ -20,13 +20,30 @@ SAMPLE = "\n".join(
 
 def test_build_args_basic() -> None:
     w = SubfinderWrapper()
-    assert w.build_args("Example.com") == ["subfinder", "-d", "example.com", "-silent", "-json"]
+    assert w.build_args("Example.com") == [
+        "subfinder",
+        "-d",
+        "example.com",
+        "-silent",
+        "-json",
+        "-config",
+        "/etc/subfinder/config.yaml",
+        "-sources",
+        ",".join(PASSIVE_SOURCES),
+    ]
 
 
 def test_build_args_flags() -> None:
-    args = SubfinderWrapper(all_sources=True, recursive=True).build_args("example.com")
-    assert "-all" in args
+    args = SubfinderWrapper(recursive=True).build_args("example.com")
     assert "-recursive" in args
+
+
+def test_build_args_always_restricts_sources() -> None:
+    # Décision imposée (E3b) : jamais -all, toujours la liste fixe sans clé.
+    args = SubfinderWrapper(recursive=True).build_args("example.com")
+    assert "-all" not in args
+    idx = args.index("-sources")
+    assert args[idx + 1] == ",".join(PASSIVE_SOURCES)
 
 
 def test_build_args_is_a_list_no_shell() -> None:
