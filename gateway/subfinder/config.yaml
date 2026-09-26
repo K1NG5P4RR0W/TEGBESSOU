@@ -1,0 +1,6 @@
+# Fichier de configuration "flags" de subfinder — vide intentionnellement.
+# subfinder v2.16.0 erreur s'il ne trouve PAS ce fichier (même vide), au lieu
+# d'utiliser des valeurs par défaut silencieuses : on le fournit explicitement
+# via `-config` (app/wrappers/subfinder.py) plutôt que de dépendre d'un
+# répertoire HOME inscriptible (le rootfs du worker est read_only, seul /tmp
+# est un tmpfs éphémère — ce fichier est baké dans l'image, en lecture seule).

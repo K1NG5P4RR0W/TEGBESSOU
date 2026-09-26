@@ -1,13 +1,15 @@
-"""Tests d'intégration E1 : enqueue (API) -> worker arq -> collecte -> audit.
+"""Tests d'intégration E1 + E3b : enqueue (API) -> worker arq -> collecte -> audit.
 
-Le worker de test (`run_worker`) est le même code que `app.worker.WorkerSettings`,
-exécuté en mode burst contre un Redis en mémoire partagé avec l'API (fakeredis).
+Le worker de test (`run_worker`, ou un `arq_worker.Worker` construit ad hoc
+pour subfinder) exécute le même contrat que `app.worker.WorkerSettings`, en
+mode burst contre un Redis en mémoire partagé avec l'API (fakeredis).
 """
 
 import asyncio
 import uuid
 from collections.abc import Callable, Coroutine
 
+from arq import worker as arq_worker
 from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,10 +18,29 @@ from app.models.tables import User
 from app.security import tokens
 from app.security.audit import verify_chain
 from app.security.passwords import hash_password
+from tests.conftest import _fake_arq_pool
 
 
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+async def run_subfinder(
+    ctx: dict[str, object], args: list[str], timeout_seconds: float = 60.0
+) -> dict[str, object]:
+    """Remplace le binaire réel dans les tests : sortie subfinder d'exemple,
+    jamais de réseau. Doit rester une fonction de MODULE : arq enregistre le
+    job sous ce nom (`enqueue_job("run_subfinder", ...)`), et une closure
+    imbriquée dans une fonction de test n'est pas résolue correctement."""
+    return {
+        "status": "done",
+        "stdout": (
+            '{"host":"api.example.com","source":"hackertarget"}\n'
+            '{"host":"mail.example.com","source":"rapiddns"}\n'
+        ),
+        "exit_code": 0,
+        "duration_ms": 1,
+    }
 
 
 async def _lead_token(session: AsyncSession) -> str:
@@ -94,11 +115,15 @@ async def test_noop_task_full_lifecycle(
         text("SELECT schema_name FROM engagements WHERE id = :id"), {"id": uuid.UUID(eid)}
     )
     row = (
-        await session.execute(
-            text(f'SELECT status, tool, output_ref FROM "{schema}".tasks WHERE id = :id'),  # noqa: S608
-            {"id": uuid.UUID(task_id)},
+        (
+            await session.execute(
+                text(f'SELECT status, tool, output_ref FROM "{schema}".tasks WHERE id = :id'),  # noqa: S608
+                {"id": uuid.UUID(task_id)},
+            )
         )
-    ).mappings().first()
+        .mappings()
+        .first()
+    )
     assert row is not None
     assert row["status"] == "done"
     assert row["tool"] == "noop"
@@ -172,6 +197,101 @@ async def test_kill_already_finished_task_rejected(
 
     kill = await client.post(f"/engagements/{eid}/tasks/{task_id}/kill", headers=_auth(token))
     assert kill.status_code == 409
+
+
+async def _add_scope(
+    client: AsyncClient, token: str, eid: str, *, kind: str, value: str, disposition: str
+) -> None:
+    resp = await client.post(
+        f"/engagements/{eid}/scope",
+        headers=_auth(token),
+        json={"kind": kind, "value": value, "disposition": disposition},
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_subfinder_enqueue_out_of_scope_is_403_and_audited(
+    client: AsyncClient, session: AsyncSession
+) -> None:
+    token = await _lead_token(session)
+    eid = await _create_active_engagement(client, token)
+    # Aucune règle in_scope pour ce domaine : default deny.
+    enq = await client.post(
+        f"/engagements/{eid}/tasks/subfinder",
+        headers=_auth(token),
+        json={"target": "hors-scope.example"},
+    )
+    assert enq.status_code == 403
+
+    assert await verify_chain(session) is True
+    row = (
+        (
+            await session.execute(
+                text(
+                    "SELECT action, target FROM audit_log "
+                    "WHERE engagement_id = :eid AND action = 'scope.violation' "
+                    "ORDER BY ts DESC LIMIT 1"
+                ),
+                {"eid": uuid.UUID(eid)},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    assert row is not None
+    assert row["target"] == "hors-scope.example"
+
+
+async def test_subfinder_task_persists_discovered_assets(
+    client: AsyncClient,
+    session: AsyncSession,
+    fake_redis_server: object,
+) -> None:
+    """Parsing + persistance (E3b), testables hors réseau (docs/E3_EGRESS_DESIGN.md
+    §9) : le job arq est ici une sortie subfinder d'exemple, jamais le binaire
+    réel ni un accès réseau — la preuve réseau réelle (sas/allowlist B) se fait
+    en runtime Docker (voir egress-gateway/README.md et la PR)."""
+    token = await _lead_token(session)
+    eid = await _create_active_engagement(client, token)
+    await _add_scope(client, token, eid, kind="domain", value="example.com", disposition="in_scope")
+
+    enq = await client.post(
+        f"/engagements/{eid}/tasks/subfinder",
+        headers=_auth(token),
+        json={"target": "example.com"},
+    )
+    assert enq.status_code == 201, enq.text
+    task_id = enq.json()["id"]
+
+    worker_redis = _fake_arq_pool(fake_redis_server)
+    w = arq_worker.Worker(
+        functions=[run_subfinder], redis_pool=worker_redis, burst=True, poll_delay=0.05
+    )
+    await w.async_run()
+    await worker_redis.aclose()
+
+    poll = await client.get(f"/engagements/{eid}/tasks/{task_id}", headers=_auth(token))
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "done"
+
+    schema = await session.scalar(
+        text("SELECT schema_name FROM engagements WHERE id = :id"), {"id": uuid.UUID(eid)}
+    )
+    rows = (
+        (
+            await session.execute(
+                text(f'SELECT value, kind, discovered_by, in_scope FROM "{schema}".assets'),  # noqa: S608
+            )
+        )
+        .mappings()
+        .all()
+    )
+    values = {r["value"] for r in rows}
+    assert values == {"api.example.com", "mail.example.com"}
+    for r in rows:
+        assert r["kind"] == "subdomain"
+        assert r["discovered_by"] == "subfinder"
+        assert r["in_scope"] is True
 
 
 async def test_worker_imports_no_database_driver() -> None:

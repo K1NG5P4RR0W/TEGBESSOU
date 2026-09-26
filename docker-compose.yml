@@ -67,7 +67,9 @@ services:
       retries: 5
 
   gateway:
-    build: ./gateway
+    build:
+      context: ./gateway
+      target: gateway
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-tegbessou}
@@ -97,17 +99,32 @@ services:
       retries: 10
       start_period: 30s
 
-  # Worker arq isolé (E1, egress sandboxé depuis E3a).
-  # Même image que la gateway ; commande + réseau + sandbox différents.
+  # Worker arq isolé (E1, egress sandboxé depuis E3a, subfinder depuis E3b).
+  # Même base d'image que la gateway (Dockerfile multi-stage, stage `worker`) ;
+  # commande + réseau + sandbox différents. C'EST le seul stage qui contient
+  # des outils offensifs (subfinder ici, épinglé — httpx/nmap suivront le
+  # même patron) : la gateway (stage `gateway`) n'en contient aucun, pour ne
+  # pas grossir la surface d'attaque du composant exposé.
   # PAS de variable POSTGRES_* : le worker ne connaît que Redis.
   # Réseau : worker_net UNIQUEMENT (internal: true). Sa route par défaut est
   # réécrite par worker-netinit vers egress-gateway ; il n'a AUCUNE route
   # Internet directe. Redis reste joignable en direct (même sous-réseau).
   worker:
-    build: ./gateway
+    build:
+      context: ./gateway
+      target: worker
     command: ["arq", "app.worker.WorkerSettings"]
     environment:
       REDIS_URL: redis://redis:6379/0
+      # REQUIS (vérifié à l'exécution), pas seulement défensif : subfinder
+      # résout un répertoire $HOME avant même d'honorer `-config`, et échoue
+      # si $HOME n'est pas défini du tout (UID non-root sans passwd exploité
+      # par la lib de conf sous-jacente). La valeur pointe sur le tmpfs (seul
+      # chemin inscriptible, cf. read_only ci-dessous) mais reste VIDE :
+      # aucun fichier n'y est lu, le seul fichier réellement chargé est celui
+      # baké en lecture seule et pointé explicitement par `-config`
+      # (app/wrappers/subfinder.py, voir Dockerfile stage `worker`).
+      HOME: /tmp
     # Le résolveur DNS interne de Docker (127.0.0.11) refuse de transiter les
     # requêtes externes sur un réseau internal:true (anti-exfiltration côté
     # Docker) : le worker utilise donc directement le résolveur contrôlé de
@@ -167,7 +184,10 @@ services:
     build: ./egress-gateway
     environment:
       WORKER_NET_SUBNET: 10.90.0.0/24
-      EGRESS_POLICY_FILE: /etc/egress/policy/allowlist-test.conf
+      # Allowlist B réelle (E3b) : sources OSINT passives de subfinder, sans
+      # clé API. allowlist-test.conf reste dans le dépôt pour les vérifications
+      # manuelles de la barrière (E3a, example.com) — voir egress-gateway/README.md.
+      EGRESS_POLICY_FILE: /etc/egress/policy/allowlist-osint.conf
     volumes:
       - ./egress-gateway/policy:/etc/egress/policy:ro
     networks:

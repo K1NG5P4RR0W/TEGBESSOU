@@ -1,9 +1,13 @@
-"""Plomberie d'exécution (E1) : enqueue → worker isolé → collecte → audit.
+"""Plomberie d'exécution (E1) + premier module RECON réel (E3b).
 
-Aucune cible réseau ici : seule une commande triviale et sûre (`echo`/`id`/
-`sleep`, args typés) est mise en file pour le worker arq. Le worker ne touche
-pas la base ; c'est cette API qui récupère son résultat (poll), persiste la
-ligne `tasks` et journalise. Voir docs/EXECUTION_DESIGN.md (E1).
+E1 : une commande triviale et sûre (`echo`/`id`/`sleep`, args typés) est mise
+en file pour le worker arq — aucune cible réseau.
+E3b : un job subfinder réel est mis en file pour un engagement ACTIF, cible
+validée par le Scope Enforcer (hors scope = 403 + audit). Le worker exécute
+subfinder à travers le sas d'egress (allowlist B, E3a) et ne touche jamais la
+base ; c'est cette API qui récupère son résultat (poll), parse la sortie
+(`SubfinderWrapper`), persiste les sous-domaines découverts comme assets et
+journalise. Voir docs/EXECUTION_DESIGN.md (E1) et docs/E3_EGRESS_DESIGN.md (E3b).
 """
 
 from __future__ import annotations
@@ -20,7 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, get_arq_pool, get_current_user, get_session, require_role
 from app.models.tables import Engagement
 from app.security.audit import append_audit
+from app.security.scope import ScopeViolationError, enforce_scope
+from app.services.assets import insert_discovered_assets
 from app.services.execution import create_queued_task, finalize_task, get_task, mark_task_running
+from app.wrappers.subfinder import InvalidTargetError, SubfinderWrapper
 
 router = APIRouter(prefix="/engagements/{engagement_id}/tasks", tags=["tasks"])
 
@@ -32,6 +39,12 @@ class NoopTaskIn(BaseModel):
     message: str = Field(default="tegbessou-e1-noop", max_length=200)
     seconds: int = Field(default=0, ge=0, le=60)
     timeout_seconds: float = Field(default=5.0, gt=0, le=20)
+
+
+class SubfinderTaskIn(BaseModel):
+    target: str = Field(..., min_length=1, max_length=253)
+    recursive: bool = False
+    timeout_seconds: float = Field(default=60.0, gt=0, le=120)
 
 
 class TaskOut(BaseModel):
@@ -119,6 +132,56 @@ async def enqueue_noop_task(
     return TaskOut(id=str(task_id), tool="noop", target=body.command, status="queued")
 
 
+@router.post("/subfinder", status_code=status.HTTP_201_CREATED)
+async def enqueue_subfinder_task(
+    engagement_id: uuid.UUID,
+    body: SubfinderTaskIn,
+    actor: CurrentUser = Depends(require_role("analyst")),
+    session: AsyncSession = Depends(get_session),
+    arq_pool: ArqRedis = Depends(get_arq_pool),
+) -> TaskOut:
+    """Met en file un job subfinder réel — passif, sources fixes sans clé
+    (voir app/wrappers/subfinder.py), sortie réseau via le sas d'egress."""
+    eng = await _get_active_engagement(session, engagement_id)
+    try:
+        await enforce_scope(
+            session, engagement_id=engagement_id, target=body.target, actor_id=actor.id
+        )
+    except ScopeViolationError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+    wrapper = SubfinderWrapper(recursive=body.recursive)
+    try:
+        args = wrapper.build_args(body.target)
+    except InvalidTargetError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    task_id = uuid.uuid4()
+    await create_queued_task(
+        session,
+        eng.schema_name,
+        task_id=task_id,
+        phase="recon",
+        tool="subfinder",
+        target=body.target,
+        args_json={"args": args, "timeout_seconds": body.timeout_seconds},
+    )
+    await append_audit(
+        session,
+        action="task.enqueue",
+        actor_id=actor.id,
+        engagement_id=engagement_id,
+        target=body.target,
+        params={"task_id": str(task_id), "tool": "subfinder"},
+    )
+    await session.commit()
+    # TODO(E3): réconcilier les tâches orphelines, cf. même limite sur /noop.
+    await arq_pool.enqueue_job("run_subfinder", args, body.timeout_seconds, _job_id=str(task_id))
+    return TaskOut(id=str(task_id), tool="subfinder", target=body.target, status="queued")
+
+
 @router.get("/{task_id}")
 async def get_task_status(
     engagement_id: uuid.UUID,
@@ -142,6 +205,15 @@ async def get_task_status(
         else:
             result = info.result if info.success else {"status": "failed", "exit_code": None}
             new_status = str(result.get("status", "failed"))
+            if str(row["tool"]) == "subfinder" and new_status == "done":
+                parsed = SubfinderWrapper().parse(str(result.get("stdout", "")), str(row["target"]))
+                await insert_discovered_assets(
+                    session,
+                    eng.schema_name,
+                    engagement_id=engagement_id,
+                    items=parsed.items,
+                    discovered_by="subfinder",
+                )
             await finalize_task(session, eng.schema_name, task_id, status=new_status, result=result)
             await append_audit(
                 session,

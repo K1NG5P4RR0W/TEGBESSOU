@@ -1,7 +1,8 @@
-"""Wrapper subfinder — énumération passive de sous-domaines (E2-1, référence).
+"""Wrapper subfinder — énumération passive de sous-domaines (E2-1/E3b).
 
 Aucun réseau ici : `build_args` fabrique la commande, `parse` normalise la
-sortie JSON lines de subfinder. L'exécution réelle est faite par le worker.
+sortie JSON lines de subfinder. L'exécution réelle est faite par le worker,
+qui ne peut sortir que via le sas d'egress (allowlist B, E3a/E3b).
 """
 
 from __future__ import annotations
@@ -17,6 +18,32 @@ from app.wrappers.base import ToolWrapper, WrapperItem, WrapperResult
 # entrée douteuse.
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
 
+# Sources passives fixes, sans clé API (E3b, décision imposée). Vérifiées
+# contre le code source réel de subfinder v2.16.0 (nom de source + endpoint
+# HTTP contacté) — voir egress-gateway/policy/allowlist-osint.conf pour la
+# correspondance complète source -> host et les sources volontairement
+# exclues (alienvault/certspotter : clé requise désormais ; crtsh : voie
+# primaire non-HTTP). Toujours appliquée via `-sources` : pas de `-all`, qui
+# ouvrirait des sources à clé et contredirait la restriction imposée.
+PASSIVE_SOURCES: tuple[str, ...] = (
+    "hackertarget",
+    "rapiddns",
+    "anubis",
+    "sitedossier",
+    "waybackarchive",
+    "digitorus",
+    "commoncrawl",
+    "submd",
+)
+
+# subfinder v2.16.0 refuse de démarrer si ce fichier n'existe pas (vérifié à
+# l'exécution : pas de valeurs par défaut silencieuses). Baké en lecture seule
+# dans l'image worker (Dockerfile, stage `worker`) — vide, aucune clé. Ne
+# suffit pas seul : $HOME doit aussi être défini dans l'environnement du
+# worker (docker-compose.yml, `HOME: /tmp`), sinon subfinder échoue avant
+# même d'honorer `-config` — vérifié à l'exécution.
+_FLAG_CONFIG_PATH = "/etc/subfinder/config.yaml"
+
 
 class InvalidTargetError(ValueError):
     pass
@@ -26,17 +53,24 @@ class SubfinderWrapper(ToolWrapper):
     name = "subfinder"
     default_kind = "subdomain"
 
-    def __init__(self, *, all_sources: bool = False, recursive: bool = False) -> None:
-        self.all_sources = all_sources
+    def __init__(self, *, recursive: bool = False) -> None:
         self.recursive = recursive
 
     def build_args(self, target: str) -> list[str]:
         domain = target.strip().lower()
         if not _DOMAIN_RE.match(domain):
             raise InvalidTargetError(f"domaine invalide : {target!r}")
-        args = ["subfinder", "-d", domain, "-silent", "-json"]
-        if self.all_sources:
-            args.append("-all")
+        args = [
+            "subfinder",
+            "-d",
+            domain,
+            "-silent",
+            "-json",
+            "-config",
+            _FLAG_CONFIG_PATH,
+            "-sources",
+            ",".join(PASSIVE_SOURCES),
+        ]
         if self.recursive:
             args.append("-recursive")
         return args

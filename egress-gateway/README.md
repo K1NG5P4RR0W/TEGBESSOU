@@ -1,4 +1,4 @@
-# egress-gateway (E3a)
+# egress-gateway (E3a + allowlist B réelle E3b)
 
 Sidecar d'egress du worker. Deny-par-défaut : le worker ne peut atteindre
 que ce que cette passerelle autorise explicitement. Voir
@@ -28,10 +28,9 @@ que ce que cette passerelle autorise explicitement. Voir
 
 ## Fournir la politique (allowlist)
 
-Fichier `policy/allowlist-test.conf`, un nom d'hôte par ligne, `#` pour
-commentaire. Monté en lecture seule dans le conteneur
-(`/etc/egress/policy/...`) — **le worker n'y a ni accès réseau ni accès
-disque**, il ne peut jamais la modifier.
+Un fichier par politique, un nom d'hôte par ligne, `#` pour commentaire.
+Monté en lecture seule dans le conteneur (`/etc/egress/policy/...`) — **le
+worker n'y a ni accès réseau ni accès disque**, il ne peut jamais la modifier.
 
 Pour appliquer un changement de politique :
 ```
@@ -39,11 +38,17 @@ docker compose restart egress-gateway
 ```
 (l'entrypoint régénère les maps nginx au démarrage à partir du fichier monté)
 
-Pour E3a, la liste est **statique et de test** (`example.com`). Le
-durcissement par engagement (allowlist A = cibles in-scope résolues,
-allowlist B = sources OSINT curées, injectées par la Gateway au lancement
-d'un run) est prévu par le design mais **hors périmètre d'E3a** — voir
-`docs/E3_EGRESS_DESIGN.md` §6.
+- `policy/allowlist-test.conf` : allowlist de TEST (E3a), `example.com` — sert
+  aux vérifications manuelles de la barrière ci-dessous, à vide de tout outil
+  réel.
+- `policy/allowlist-osint.conf` : **allowlist B réelle (E3b)**, en usage par
+  défaut (`EGRESS_POLICY_FILE` dans `docker-compose.yml`). Les 8 sources
+  passives fixes de subfinder, sans clé API — voir ce fichier pour la
+  correspondance exacte source → endpoint (vérifiée contre le code source de
+  subfinder v2.16.0, pas supposée) et les sources volontairement exclues.
+
+L'allowlist A (cibles in-scope résolues, pour le trafic actif — httpx,
+ensuite) reste hors périmètre d'E3a/E3b — voir `docs/E3_EGRESS_DESIGN.md` §6.
 
 ## Lire les logs de refus
 
@@ -85,6 +90,71 @@ import socket
 socket.create_connection(('postgres', 5432), timeout=3)" # doit échouer (régression E1)
 docker compose exec worker env | grep -i postgres        # doit être vide
 ```
+
+## Vérifier subfinder à travers le sas (E3b)
+
+Preuve de bout en bout : scope → enqueue → worker → sas d'egress (allowlist B)
+→ résultat → persistance → audit.
+
+```
+make up
+make create-admin   # ADMIN_EMAIL=... ADMIN_PASSWORD=... si non interactif
+
+TOKEN=$(curl -s -X POST http://127.0.0.1:8001/auth/login -H "Content-Type: application/json" \
+  -d '{"email":"<ADMIN_EMAIL>","password":"<ADMIN_PASSWORD>"}' | jq -r .access_token)
+
+# 1. Engagement actif + cible in-scope.
+EID=$(curl -s -X POST http://127.0.0.1:8001/engagements -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name":"e3b","mode":"ctf"}' | jq -r .id)
+curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/authorization" -H "Authorization: Bearer $TOKEN" \
+  -F source_kind=program_url -F program_url=https://p/rules
+curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/activate" -H "Authorization: Bearer $TOKEN"
+curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/scope" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"kind":"domain","value":"hackerone.com","disposition":"in_scope"}'
+
+# 2. Job subfinder réel sur la cible in-scope.
+TID=$(curl -s -X POST "http://127.0.0.1:8001/engagements/$EID/tasks/subfinder" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"target":"hackerone.com"}' | jq -r .id)
+
+# 3. Attendre la fin du job, puis poller (le poll persiste assets + audit).
+sleep 20
+curl -s "http://127.0.0.1:8001/engagements/$EID/tasks/$TID" -H "Authorization: Bearer $TOKEN"
+# -> {"status":"done", ...}
+
+# 4. Les 8 sources OSINT contactées apparaissent, AUCUNE en refus, dans les logs du sas.
+docker compose logs egress-gateway | grep -E \
+  "api.hackertarget.com|rapiddns.io|anubisdb.com|www.sitedossier.com|web.archive.org|certificatedetails.com|index.commoncrawl.org|api.sub.md"
+docker compose logs egress-gateway | grep -iE "deny|403" | grep -E \
+  "api.hackertarget.com|rapiddns.io|anubisdb.com|www.sitedossier.com|web.archive.org|certificatedetails.com|index.commoncrawl.org|api.sub.md"
+# -> ne doit rien renvoyer : aucune des 8 sources n'a été bloquée.
+
+# 5. Deny-par-défaut TOUJOURS intact : une destination hors allowlist reste bloquée.
+docker compose exec worker python3 -c "
+import socket, ssl
+ctx = ssl.create_default_context()
+ctx.wrap_socket(socket.create_connection(('example.org', 443), timeout=6), server_hostname='example.org')"
+                                                          # doit échouer (SSLEOFError)
+docker compose logs egress-gateway | grep example.org    # refus loggé
+
+# 6. Scope enforcé : cible hors scope refusée avant même la mise en file.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://127.0.0.1:8001/engagements/$EID/tasks/subfinder" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"target":"hors-scope.example"}'
+# -> 403 (+ ligne audit "scope.violation" — voir table audit_log)
+
+# 7. Régression E1/E3a : le worker n'a toujours aucun accès direct DB/Internet.
+docker compose exec worker python3 -c "
+import socket
+socket.create_connection(('postgres', 5432), timeout=3)" # doit échouer
+docker compose exec worker env | grep -i postgres         # doit être vide
+```
+
+Les sources sans clé peuvent renvoyer 0 résultat pour un domaine donné sans
+que ce soit un échec de la barrière (c'est le contenu OSINT qui varie, pas le
+filtrage réseau) — ce qui compte pour la preuve E3b est l'absence de refus
+dans les logs du sas pour les 8 hôtes de l'allowlist B, pas le nombre exact de
+sous-domaines trouvés.
 
 ## Limites connues (honnêtes, pour E3a)
 
