@@ -184,10 +184,12 @@ services:
     build: ./egress-gateway
     environment:
       WORKER_NET_SUBNET: 10.90.0.0/24
-      # Allowlist B réelle (E3b) : sources OSINT passives de subfinder, sans
-      # clé API. allowlist-test.conf reste dans le dépôt pour les vérifications
+      # Allowlist B (E3b, sources OSINT passives de subfinder, sans clé API) +
+      # allowlist A (E3 final, cible in-scope de TEST pour httpx) chargées
+      # ENSEMBLE — liste de fichiers séparés par ':', voir entrypoint.sh.
+      # allowlist-test.conf reste dans le dépôt pour les vérifications
       # manuelles de la barrière (E3a, example.com) — voir egress-gateway/README.md.
-      EGRESS_POLICY_FILE: /etc/egress/policy/allowlist-osint.conf
+      EGRESS_POLICY_FILE: /etc/egress/policy/allowlist-osint.conf:/etc/egress/policy/allowlist-target-test.conf
     volumes:
       - ./egress-gateway/policy:/etc/egress/policy:ro
     networks:
