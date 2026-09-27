@@ -1,4 +1,4 @@
-"""Worker arq isolé — E1 (plomberie) + E3b (subfinder réel).
+"""Worker arq isolé — E1 (plomberie) + E3b (subfinder réel) + E3 final (httpx réel).
 
 Ce worker ne connaît QUE Redis (pas de credentials PostgreSQL, pas de secret).
 Il exécute une commande via un tableau d'arguments typé (jamais `shell=True`),
@@ -6,11 +6,12 @@ la normalise, et renvoie le résultat à la gateway via le résultat du job arq.
 C'est la gateway (voir `app/services/execution.py`) qui persiste en base et
 journalise — le worker n'écrit jamais en base.
 
-`run_noop` (E1) n'ouvre aucun réseau externe. `run_subfinder` (E3b) exécute le
-premier outil qui sort réellement vers le réseau — via le sas d'egress (E3a),
-jamais en direct (le worker n'a aucune route Internet directe). Les deux
-tâches partagent le même modèle d'exécution (`_run_subprocess`) : timeout +
-kill switch identiques.
+`run_noop` (E1) n'ouvre aucun réseau externe. `run_subfinder` (E3b, passif) et
+`run_httpx` (E3 final, actif) sortent réellement vers le réseau — via le sas
+d'egress (E3a), jamais en direct (le worker n'a aucune route Internet
+directe) : subfinder par l'allowlist B (sources OSINT), httpx par l'allowlist
+A (cible in-scope de l'engagement). Les trois tâches partagent le même modèle
+d'exécution (`_run_subprocess`) : timeout + kill switch identiques.
 """
 
 from __future__ import annotations
@@ -112,8 +113,22 @@ async def run_subfinder(
     return await _run_subprocess(ctx, args, timeout_seconds)
 
 
+async def run_httpx(
+    ctx: dict[str, Any], args: list[str], timeout_seconds: float = 60.0
+) -> dict[str, Any]:
+    """E3 final : exécute la commande produite par `HttpxWrapper.build_args`.
+
+    httpx est du trafic ACTIF : il touche la cible in-scope de l'engagement,
+    contrairement à subfinder (passif). Même modèle que `run_noop`/
+    `run_subfinder` (timeout + kill switch) ; la sortie brute (JSON lines) est
+    renvoyée telle quelle, c'est la gateway qui la parse (`HttpxWrapper.parse`)
+    et persiste les hôtes vivants.
+    """
+    return await _run_subprocess(ctx, args, timeout_seconds)
+
+
 class WorkerSettings:
-    functions = (run_noop, run_subfinder)
+    functions = (run_noop, run_subfinder, run_httpx)
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 4
     job_timeout = 90

@@ -1,4 +1,4 @@
-"""Plomberie d'exécution (E1) + premier module RECON réel (E3b).
+"""Plomberie d'exécution (E1) + modules RECON réels (E3b subfinder, E3 final httpx).
 
 E1 : une commande triviale et sûre (`echo`/`id`/`sleep`, args typés) est mise
 en file pour le worker arq — aucune cible réseau.
@@ -8,6 +8,9 @@ subfinder à travers le sas d'egress (allowlist B, E3a) et ne touche jamais la
 base ; c'est cette API qui récupère son résultat (poll), parse la sortie
 (`SubfinderWrapper`), persiste les sous-domaines découverts comme assets et
 journalise. Voir docs/EXECUTION_DESIGN.md (E1) et docs/E3_EGRESS_DESIGN.md (E3b).
+E3 final : même patron pour httpx, mais ACTIF (il touche la cible in-scope,
+donc l'allowlist A du sas — pas l'allowlist B). Wrapper récupéré via le
+registre (`app.wrappers.registry`, E2-3).
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ from app.security.audit import append_audit
 from app.security.scope import ScopeViolationError, enforce_scope
 from app.services.assets import insert_discovered_assets
 from app.services.execution import create_queued_task, finalize_task, get_task, mark_task_running
+from app.wrappers.httpx import InvalidTargetError as InvalidHttpxTargetError
+from app.wrappers.registry import get_wrapper
 from app.wrappers.subfinder import InvalidTargetError, SubfinderWrapper
 
 router = APIRouter(prefix="/engagements/{engagement_id}/tasks", tags=["tasks"])
@@ -45,6 +50,11 @@ class SubfinderTaskIn(BaseModel):
     target: str = Field(..., min_length=1, max_length=253)
     recursive: bool = False
     timeout_seconds: float = Field(default=60.0, gt=0, le=120)
+
+
+class HttpxTaskIn(BaseModel):
+    target: str = Field(..., min_length=1, max_length=253)
+    timeout_seconds: float = Field(default=30.0, gt=0, le=60)
 
 
 class TaskOut(BaseModel):
@@ -126,8 +136,6 @@ async def enqueue_noop_task(
         params={"task_id": str(task_id)},
     )
     await session.commit()
-    # TODO(E3): réconcilier les tâches orphelines (ligne `queued` sans job arq)
-    # si le process meurt entre le commit et l’enqueue — balayage à ajouter.
     await arq_pool.enqueue_job("run_noop", args, body.timeout_seconds, _job_id=str(task_id))
     return TaskOut(id=str(task_id), tool="noop", target=body.command, status="queued")
 
@@ -177,9 +185,57 @@ async def enqueue_subfinder_task(
         params={"task_id": str(task_id), "tool": "subfinder"},
     )
     await session.commit()
-    # TODO(E3): réconcilier les tâches orphelines, cf. même limite sur /noop.
     await arq_pool.enqueue_job("run_subfinder", args, body.timeout_seconds, _job_id=str(task_id))
     return TaskOut(id=str(task_id), tool="subfinder", target=body.target, status="queued")
+
+
+@router.post("/httpx", status_code=status.HTTP_201_CREATED)
+async def enqueue_httpx_task(
+    engagement_id: uuid.UUID,
+    body: HttpxTaskIn,
+    actor: CurrentUser = Depends(require_role("analyst")),
+    session: AsyncSession = Depends(get_session),
+    arq_pool: ArqRedis = Depends(get_arq_pool),
+) -> TaskOut:
+    """Met en file un job httpx réel — ACTIF (touche la cible in-scope),
+    sortie réseau via le sas d'egress (allowlist A, cible de l'engagement)."""
+    eng = await _get_active_engagement(session, engagement_id)
+    try:
+        await enforce_scope(
+            session, engagement_id=engagement_id, target=body.target, actor_id=actor.id
+        )
+    except ScopeViolationError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+    wrapper = get_wrapper("httpx")
+    try:
+        args = wrapper.build_args(body.target)
+    except InvalidHttpxTargetError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    task_id = uuid.uuid4()
+    await create_queued_task(
+        session,
+        eng.schema_name,
+        task_id=task_id,
+        phase="recon",
+        tool="httpx",
+        target=body.target,
+        args_json={"args": args, "timeout_seconds": body.timeout_seconds},
+    )
+    await append_audit(
+        session,
+        action="task.enqueue",
+        actor_id=actor.id,
+        engagement_id=engagement_id,
+        target=body.target,
+        params={"task_id": str(task_id), "tool": "httpx"},
+    )
+    await session.commit()
+    await arq_pool.enqueue_job("run_httpx", args, body.timeout_seconds, _job_id=str(task_id))
+    return TaskOut(id=str(task_id), tool="httpx", target=body.target, status="queued")
 
 
 @router.get("/{task_id}")
@@ -198,8 +254,28 @@ async def get_task_status(
         job = Job(str(task_id), arq_pool)
         info = await job.result_info()
         if info is None:
-            if row["status"] == "queued" and await job.status() == JobStatus.in_progress:
+            job_status = await job.status()
+            if row["status"] == "queued" and job_status == JobStatus.in_progress:
                 await mark_task_running(session, eng.schema_name, task_id)
+                await session.commit()
+                row = await _require_task(session, eng.schema_name, task_id)
+            elif job_status == JobStatus.not_found:
+                # Tâche orpheline : plus de job arq correspondant (le process a
+                # pu mourir entre le commit `queued` et l'enqueue arq), et le
+                # job n'a jamais tourné (pas de résultat) — jamais coincée
+                # indéfiniment, on la clôt en échec.
+                result = {"status": "failed", "exit_code": None, "reason": "orphaned"}
+                await finalize_task(
+                    session, eng.schema_name, task_id, status="failed", result=result
+                )
+                await append_audit(
+                    session,
+                    action="task.run",
+                    actor_id=actor.id,
+                    engagement_id=engagement_id,
+                    target=str(row["tool"]),
+                    params={"task_id": str(task_id), "status": "failed", "reason": "orphaned"},
+                )
                 await session.commit()
                 row = await _require_task(session, eng.schema_name, task_id)
         else:
@@ -213,6 +289,16 @@ async def get_task_status(
                     engagement_id=engagement_id,
                     items=parsed.items,
                     discovered_by="subfinder",
+                )
+            elif str(row["tool"]) == "httpx" and new_status == "done":
+                stdout = str(result.get("stdout", ""))
+                parsed = get_wrapper("httpx").parse(stdout, str(row["target"]))
+                await insert_discovered_assets(
+                    session,
+                    eng.schema_name,
+                    engagement_id=engagement_id,
+                    items=parsed.items,
+                    discovered_by="httpx",
                 )
             await finalize_task(session, eng.schema_name, task_id, status=new_status, result=result)
             await append_audit(

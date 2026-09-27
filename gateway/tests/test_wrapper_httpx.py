@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.wrappers.base import WrapperResult
@@ -33,6 +35,21 @@ def test_build_args_is_a_list_no_shell() -> None:
     assert isinstance(HttpxWrapper().build_args("example.com"), list)
 
 
+def test_build_args_bounds_time_on_unreachable_targets() -> None:
+    args = HttpxWrapper().build_args("example.com")
+    assert "-timeout" in args
+    assert args[args.index("-timeout") + 1] == "7"
+    assert "-retries" in args
+    assert args[args.index("-retries") + 1] == "0"
+    assert "-include-response-header" in args
+
+
+def test_build_args_timeout_and_retries_are_configurable() -> None:
+    args = HttpxWrapper(timeout=3, retries=1).build_args("example.com")
+    assert args[args.index("-timeout") + 1] == "3"
+    assert args[args.index("-retries") + 1] == "1"
+
+
 def test_build_args_rejects_bad_targets() -> None:
     w = HttpxWrapper()
     for bad in ["", "not a host", "a;rm -rf /", "http://x", "example"]:
@@ -63,3 +80,72 @@ def test_parse_falls_back_to_host_when_no_url() -> None:
 
 def test_parse_empty() -> None:
     assert HttpxWrapper().parse("", "example.com").items == []
+
+
+def test_parse_discards_sas_denial_via_header() -> None:
+    """httpx v1.12.0 expose les en-têtes de réponse sous `header` (objet),
+    avec des clés normalisées (`-` -> `_`) — pas de champ `raw_header`."""
+    out = json.dumps(
+        {
+            "url": "http://example.org",
+            "host": "example.org",
+            "status_code": 403,
+            "webserver": "nginx/1.27.5",
+            "content_length": 153,
+            "header": {
+                "server": "nginx/1.27.5",
+                "content_length": "153",
+                "x_egress_denied": "1",
+            },
+        }
+    )
+    result = HttpxWrapper().parse(out, "example.org")
+    assert result.items == []
+
+
+def test_parse_keeps_real_response_with_unrelated_headers() -> None:
+    """Un objet `header` sans `x_egress_denied` ne doit jamais déclencher le
+    filet primaire (seul le repli signature peut alors écarter l'entrée)."""
+    out = json.dumps(
+        {
+            "url": "https://api.example.com",
+            "status_code": 200,
+            "webserver": "nginx",
+            "content_length": 1024,
+            "header": {"server": "nginx", "content_length": "1024"},
+        }
+    )
+    result = HttpxWrapper().parse(out, "example.com")
+    assert [i.value for i in result.items] == ["https://api.example.com"]
+
+
+def test_parse_discards_sas_denial_via_signature_fallback() -> None:
+    """Repli signature : même sans X-Egress-Denied dans raw_header (en-tête
+    non émis/capturé), le triplet (webserver, status_code, content_length)
+    exact du refus nginx suffit à écarter l'entrée."""
+    out = json.dumps(
+        {
+            "url": "http://example.org",
+            "host": "example.org",
+            "status_code": 403,
+            "webserver": "nginx/1.27.5",
+            "content_length": 153,
+        }
+    )
+    result = HttpxWrapper().parse(out, "example.org")
+    assert result.items == []
+
+
+def test_parse_keeps_real_403_that_does_not_match_sas_signature() -> None:
+    """Un vrai 403 de la cible (webserver différent, ou content_length
+    différent) n'est PAS un refus du sas et doit rester persisté."""
+    out = json.dumps(
+        {
+            "url": "https://mail.example.com",
+            "status_code": 403,
+            "webserver": "Apache",
+            "content_length": 512,
+        }
+    )
+    result = HttpxWrapper().parse(out, "example.com")
+    assert [i.value for i in result.items] == ["https://mail.example.com"]

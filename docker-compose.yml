@@ -113,7 +113,18 @@ services:
     build:
       context: ./gateway
       target: worker
-    command: ["arq", "app.worker.WorkerSettings"]
+    # Attend que worker-netinit ait posé la route par défaut vers le sas
+    # avant de laisser arq traiter le moindre job (voir
+    # gateway/scripts/wait_for_egress_route.py) : sans ça, un worker
+    # recréé (rebuild d'image, `docker compose up worker` seul) pouvait
+    # démarrer et consommer des jobs réseau AVANT que worker-netinit
+    # (démarré après lui, cf. depends_on) ait tourné — tout job réseau
+    # échouait alors en silence (stdout vide, exit 0). Voir
+    # egress-gateway/README.md § Piège worker-netinit.
+    command:
+      - sh
+      - -c
+      - "python3 /app/scripts/wait_for_egress_route.py && exec arq app.worker.WorkerSettings"
     environment:
       REDIS_URL: redis://redis:6379/0
       # REQUIS (vérifié à l'exécution), pas seulement défensif : subfinder
@@ -139,7 +150,18 @@ services:
         condition: service_healthy
     networks:
       - worker_net
-    mem_limit: 256m
+    # 1024m, pas 256m : mesuré en runtime, un seul processus httpx (flags par
+    # défaut du wrapper : -tech-detect charge la base d'empreintes Wappalyzer
+    # en mémoire) atteint ~230MB RSS à lui seul — collé au plafond de 256m.
+    # `WorkerSettings.max_jobs = 4` (app/worker.py) autorise jusqu'à 4 jobs
+    # subprocess concurrents : à 256m, 2 httpx simultanés suffisaient déjà à
+    # déclencher l'OOM killer du cgroup (confirmé via
+    # /sys/fs/cgroup/memory.events : oom_kill > 0), avec deux symptômes —
+    # l'un des deux tué (exit 137/-9), l'autre simplement ralenti de ~1s à
+    # 30-40s par la pression mémoire (reclaim), sans lien avec les flags
+    # httpx ni avec le sas. 1024m couvre 4 httpx concurrents (~230MB pièce)
+    # avec marge pour l'overhead arq/python.
+    mem_limit: 1024m
     read_only: true
     tmpfs:
       - /tmp
@@ -147,6 +169,21 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Visibilité seulement (rien ne `depends_on: worker: condition:
+    # service_healthy` — la garantie réelle est le `command` ci-dessus, qui
+    # bloque arq tant que la route n'existe pas). Permet de voir dans
+    # `docker compose ps` qu'un worker fraîchement recréé est encore en
+    # train d'attendre worker-netinit.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import sys; sys.exit(0 if any(l.split()[1]=='00000000' for l in open('/proc/net/route').readlines()[1:]) else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
 
   # Réécrit UNE FOIS la route par défaut du worker vers egress-gateway, puis
   # s'arrête. Partage le netns du worker (network_mode) : NET_ADMIN reste sur
@@ -184,10 +221,12 @@ services:
     build: ./egress-gateway
     environment:
       WORKER_NET_SUBNET: 10.90.0.0/24
-      # Allowlist B réelle (E3b) : sources OSINT passives de subfinder, sans
-      # clé API. allowlist-test.conf reste dans le dépôt pour les vérifications
+      # Allowlist B (E3b, sources OSINT passives de subfinder, sans clé API) +
+      # allowlist A (E3 final, cible in-scope de TEST pour httpx) chargées
+      # ENSEMBLE — liste de fichiers séparés par ':', voir entrypoint.sh.
+      # allowlist-test.conf reste dans le dépôt pour les vérifications
       # manuelles de la barrière (E3a, example.com) — voir egress-gateway/README.md.
-      EGRESS_POLICY_FILE: /etc/egress/policy/allowlist-osint.conf
+      EGRESS_POLICY_FILE: /etc/egress/policy/allowlist-osint.conf:/etc/egress/policy/allowlist-target-test.conf
     volumes:
       - ./egress-gateway/policy:/etc/egress/policy:ro
     networks:
