@@ -150,7 +150,18 @@ services:
         condition: service_healthy
     networks:
       - worker_net
-    mem_limit: 256m
+    # 1024m, pas 256m : mesuré en runtime, un seul processus httpx (flags par
+    # défaut du wrapper : -tech-detect charge la base d'empreintes Wappalyzer
+    # en mémoire) atteint ~230MB RSS à lui seul — collé au plafond de 256m.
+    # `WorkerSettings.max_jobs = 4` (app/worker.py) autorise jusqu'à 4 jobs
+    # subprocess concurrents : à 256m, 2 httpx simultanés suffisaient déjà à
+    # déclencher l'OOM killer du cgroup (confirmé via
+    # /sys/fs/cgroup/memory.events : oom_kill > 0), avec deux symptômes —
+    # l'un des deux tué (exit 137/-9), l'autre simplement ralenti de ~1s à
+    # 30-40s par la pression mémoire (reclaim), sans lien avec les flags
+    # httpx ni avec le sas. 1024m couvre 4 httpx concurrents (~230MB pièce)
+    # avec marge pour l'overhead arq/python.
+    mem_limit: 1024m
     read_only: true
     tmpfs:
       - /tmp

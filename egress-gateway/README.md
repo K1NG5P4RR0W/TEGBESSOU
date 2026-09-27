@@ -229,10 +229,13 @@ contourné/indisponible, l'autre rattrape) :
    juste avant le `return 403;` (`always` garantit l'envoi même sur cette
    réponse d'erreur). `HttpxWrapper.build_args` (`gateway/app/wrappers/httpx.py`)
    passe `-include-response-header` pour que httpx expose les en-têtes de
-   réponse dans son JSON (champ `raw_header`, une chaîne brute — confirmé
-   contre `runner/types.go` de httpx v1.12.0). `HttpxWrapper.parse` écarte
-   toute entrée dont `raw_header` contient `x-egress-denied` (insensible à
-   la casse), avant toute création de `WrapperItem`.
+   réponse dans son JSON — sous la clé `header` (un objet, PAS `raw_header` :
+   ce champ n'existe pas dans le JSON de httpx v1.12.0, confirmé contre
+   `runner/types.go` ; une version antérieure du code s'y fiait à tort, ce
+   qui rendait ce filet mort en silence, rattrapé par le seul repli
+   signature ci-dessous). `HttpxWrapper.parse` écarte toute entrée dont
+   `header.x_egress_denied` (clé normalisée, tiret -> underscore) est
+   présent, avant toute création de `WrapperItem`.
 2. **Repli signature** : au cas où l'en-tête ne serait pas émis/capturé
    (mauvaise version de httpx, flag oublié, autre chemin de refus…),
    `HttpxWrapper.parse` écarte aussi toute entrée dont le triplet
@@ -255,6 +258,28 @@ la cible pendant ~30s avant d'être tué par le timeout du job
 quelques secondes. `-timeout 7` reste largement en-deçà de ces deux bornes,
 donc une cible bloquée par le sas fait désormais échouer le job en
 quelques secondes, pas en attendant le timeout global du job.
+
+## Piège mem_limit (jobs httpx concurrents tués/ralentis en silence)
+
+Le worker exécute jusqu'à `max_jobs = 4` (`gateway/app/worker.py`) jobs
+subprocess en parallèle. Un seul processus httpx avec les flags par défaut
+du wrapper (`-tech-detect` charge la base d'empreintes Wappalyzer en
+mémoire) atteint **~230MB de RSS à lui seul**, mesuré via
+`/proc/<pid>/status` (`VmRSS`). Avec l'ancien `mem_limit: 256m`, deux httpx
+simultanés suffisaient à dépasser le cgroup et déclenchaient l'OOM killer
+du noyau (visible dans `dmesg` : `Memory cgroup out of memory: Killed
+process ... (httpx)`, et dans `/sys/fs/cgroup/memory.events` :
+`oom_kill > 0`) :
+- l'un des deux jobs est tué (`exit_code -9`/`137`) ;
+- l'autre **survit mais est ralenti d'un facteur ~20-40** (d'~1s à 30-40s)
+  par la pression mémoire du cgroup (reclaim), sans rapport avec les flags
+  httpx, `-timeout`, ou une quelconque saturation du sas — vérifié en
+  isolant la variable (même charge système, seul `mem_limit` change).
+
+`mem_limit` est maintenant `1024m` (voir commentaire dans
+`docker-compose.yml`), dimensionné pour 4 httpx concurrents avec marge.
+Si vous ajoutez un outil plus gourmand en mémoire au worker, revérifiez ce
+budget de la même façon (RSS solo × `max_jobs`, jamais en extrapolant).
 
 ## Vérifier httpx à travers le sas (E3 final)
 
