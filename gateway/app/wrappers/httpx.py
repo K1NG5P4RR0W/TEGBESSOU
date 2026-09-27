@@ -16,6 +16,15 @@ from app.wrappers.base import ToolWrapper, WrapperItem, WrapperResult
 
 _HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
 
+# Signature du refus HTTP du sas d'egress (egress-gateway/nginx.conf, bloc
+# `return 403;` nu -> page d'erreur nginx par défaut). Repli de défense en
+# profondeur si l'en-tête X-Egress-Denied n'apparaît pas dans la sortie httpx
+# (mauvais flag, version différente, autre chemin de refus) : voir
+# egress-gateway/README.md.
+_SAS_DENIAL_WEBSERVER = "nginx/1.27.5"
+_SAS_DENIAL_STATUS_CODE = 403
+_SAS_DENIAL_CONTENT_LENGTH = 153
+
 
 class InvalidTargetError(ValueError):
     pass
@@ -32,11 +41,15 @@ class HttpxWrapper(ToolWrapper):
         status_code: bool = True,
         title: bool = True,
         web_server: bool = True,
+        timeout: int = 7,
+        retries: int = 0,
     ) -> None:
         self.tech_detect = tech_detect
         self.status_code = status_code
         self.title = title
         self.web_server = web_server
+        self.timeout = timeout
+        self.retries = retries
 
     def build_args(self, target: str) -> list[str]:
         host = target.strip().lower()
@@ -51,7 +64,34 @@ class HttpxWrapper(ToolWrapper):
             args.append("-tech-detect")
         if self.web_server:
             args.append("-web-server")
+        # Borne le temps passé sur une cible injoignable/bloquée par le sas :
+        # sans ça httpx retente ~30s dans le vide avant d'être tué par le
+        # timeout du job (cf. egress-gateway/README.md, § httpx à travers le sas).
+        args += ["-timeout", str(self.timeout), "-retries", str(self.retries)]
+        # Expose les en-têtes de réponse dans le JSON (champ `raw_header`,
+        # cf. httpx v1.12.0 runner/types.go) pour que `parse` puisse détecter
+        # X-Egress-Denied et écarter le refus du sas.
+        args.append("-include-response-header")
         return args
+
+    @staticmethod
+    def _is_sas_denial(obj: dict[str, Any]) -> bool:
+        """Écarte une réponse qui est en fait le refus du sas d'egress, jamais
+        une vraie réponse de la cible. Deux filets indépendants (défense en
+        profondeur, cf. egress-gateway/README.md) :
+        - primaire : en-tête `X-Egress-Denied` présent dans `raw_header` ;
+        - repli : signature exacte (webserver, status_code, content_length)
+          de la page d'erreur 403 nue de nginx, au cas où l'en-tête n'aurait
+          pas été émis ou capturé (flag oublié, autre chemin de refus…).
+        """
+        raw_header = obj.get("raw_header")
+        if isinstance(raw_header, str) and "x-egress-denied" in raw_header.lower():
+            return True
+        return (
+            obj.get("webserver") == _SAS_DENIAL_WEBSERVER
+            and obj.get("status_code") == _SAS_DENIAL_STATUS_CODE
+            and obj.get("content_length") == _SAS_DENIAL_CONTENT_LENGTH
+        )
 
     def parse(self, stdout: str, target: str) -> WrapperResult:
         seen: dict[str, WrapperItem] = {}
@@ -64,6 +104,8 @@ class HttpxWrapper(ToolWrapper):
             except json.JSONDecodeError:
                 continue
             if not isinstance(obj, dict):
+                continue
+            if self._is_sas_denial(obj):
                 continue
             raw_value = obj.get("url")
             if isinstance(raw_value, str) and raw_value.strip():

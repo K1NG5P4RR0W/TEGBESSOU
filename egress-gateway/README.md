@@ -182,6 +182,46 @@ filtrage réseau) — ce qui compte pour la preuve E3b est l'absence de refus
 dans les logs du sas pour les 8 hôtes de l'allowlist B, pas le nombre exact de
 sous-domaines trouvés.
 
+## Refus HTTP identifiable (`X-Egress-Denied`) et non-persistance côté collecteur
+
+Le bloc HTTP (port 8080) du sas répond `403` en clair à toute requête dont le
+`Host` n'est pas autorisé — c'est une vraie réponse HTTP, pas un refus de
+connexion. Sans précaution, un outil actif comme httpx interprète cette
+réponse comme un hôte vivant et la ferait persister à tort comme asset. Deux
+filets indépendants évitent ça (défense en profondeur — si l'un est
+contourné/indisponible, l'autre rattrape) :
+
+1. **En-tête distinctif** : `add_header X-Egress-Denied 1 always;` est ajouté
+   juste avant le `return 403;` (`always` garantit l'envoi même sur cette
+   réponse d'erreur). `HttpxWrapper.build_args` (`gateway/app/wrappers/httpx.py`)
+   passe `-include-response-header` pour que httpx expose les en-têtes de
+   réponse dans son JSON (champ `raw_header`, une chaîne brute — confirmé
+   contre `runner/types.go` de httpx v1.12.0). `HttpxWrapper.parse` écarte
+   toute entrée dont `raw_header` contient `x-egress-denied` (insensible à
+   la casse), avant toute création de `WrapperItem`.
+2. **Repli signature** : au cas où l'en-tête ne serait pas émis/capturé
+   (mauvaise version de httpx, flag oublié, autre chemin de refus…),
+   `HttpxWrapper.parse` écarte aussi toute entrée dont le triplet
+   `(webserver, status_code, content_length)` correspond exactement à la
+   signature de la page d'erreur 403 nue de nginx observée en test :
+   `nginx/1.27.5`, `403`, `153` octets. Ce repli n'écarte que cette
+   signature exacte — un vrai 403 de la cible (autre serveur, autre taille)
+   reste persisté normalement.
+
+Le `403` lui-même n'est **pas** modifié (pas de `444`, pas de fermeture
+brute) : c'est une réponse HTTP correcte, juste identifiable.
+
+## httpx : échec rapide sur une cible bloquée par le sas
+
+`HttpxWrapper.build_args` passe systématiquement `-timeout <n>` (défaut 7s,
+configurable via le constructeur) et `-retries 0` : sans ça, httpx retente
+la cible pendant ~30s avant d'être tué par le timeout du job
+(`run_httpx`/`timeout_seconds`, défaut 60s, et `job_timeout` arq = 90s dans
+`gateway/app/worker.py`) — un `exit_code -9` au lieu d'un échec propre en
+quelques secondes. `-timeout 7` reste largement en-deçà de ces deux bornes,
+donc une cible bloquée par le sas fait désormais échouer le job en
+quelques secondes, pas en attendant le timeout global du job.
+
 ## Vérifier httpx à travers le sas (E3 final)
 
 Preuve de bout en bout : scope → enqueue → worker → sas d'egress (allowlist A,
