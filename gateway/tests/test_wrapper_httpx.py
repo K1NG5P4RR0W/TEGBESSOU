@@ -83,6 +83,8 @@ def test_parse_empty() -> None:
 
 
 def test_parse_discards_sas_denial_via_header() -> None:
+    """httpx v1.12.0 expose les en-têtes de réponse sous `header` (objet),
+    avec des clés normalisées (`-` -> `_`) — pas de champ `raw_header`."""
     out = json.dumps(
         {
             "url": "http://example.org",
@@ -90,12 +92,31 @@ def test_parse_discards_sas_denial_via_header() -> None:
             "status_code": 403,
             "webserver": "nginx/1.27.5",
             "content_length": 153,
-            "raw_header": "HTTP/1.1 403 Forbidden\r\nServer: nginx/1.27.5\r\n"
-            "X-Egress-Denied: 1\r\nContent-Length: 153\r\n\r\n",
+            "header": {
+                "server": "nginx/1.27.5",
+                "content_length": "153",
+                "x_egress_denied": "1",
+            },
         }
     )
     result = HttpxWrapper().parse(out, "example.org")
     assert result.items == []
+
+
+def test_parse_keeps_real_response_with_unrelated_headers() -> None:
+    """Un objet `header` sans `x_egress_denied` ne doit jamais déclencher le
+    filet primaire (seul le repli signature peut alors écarter l'entrée)."""
+    out = json.dumps(
+        {
+            "url": "https://api.example.com",
+            "status_code": 200,
+            "webserver": "nginx",
+            "content_length": 1024,
+            "header": {"server": "nginx", "content_length": "1024"},
+        }
+    )
+    result = HttpxWrapper().parse(out, "example.com")
+    assert [i.value for i in result.items] == ["https://api.example.com"]
 
 
 def test_parse_discards_sas_denial_via_signature_fallback() -> None:

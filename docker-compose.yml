@@ -113,7 +113,18 @@ services:
     build:
       context: ./gateway
       target: worker
-    command: ["arq", "app.worker.WorkerSettings"]
+    # Attend que worker-netinit ait posé la route par défaut vers le sas
+    # avant de laisser arq traiter le moindre job (voir
+    # gateway/scripts/wait_for_egress_route.py) : sans ça, un worker
+    # recréé (rebuild d'image, `docker compose up worker` seul) pouvait
+    # démarrer et consommer des jobs réseau AVANT que worker-netinit
+    # (démarré après lui, cf. depends_on) ait tourné — tout job réseau
+    # échouait alors en silence (stdout vide, exit 0). Voir
+    # egress-gateway/README.md § Piège worker-netinit.
+    command:
+      - sh
+      - -c
+      - "python3 /app/scripts/wait_for_egress_route.py && exec arq app.worker.WorkerSettings"
     environment:
       REDIS_URL: redis://redis:6379/0
       # REQUIS (vérifié à l'exécution), pas seulement défensif : subfinder
@@ -147,6 +158,21 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Visibilité seulement (rien ne `depends_on: worker: condition:
+    # service_healthy` — la garantie réelle est le `command` ci-dessus, qui
+    # bloque arq tant que la route n'existe pas). Permet de voir dans
+    # `docker compose ps` qu'un worker fraîchement recréé est encore en
+    # train d'attendre worker-netinit.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import sys; sys.exit(0 if any(l.split()[1]=='00000000' for l in open('/proc/net/route').readlines()[1:]) else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
 
   # Réécrit UNE FOIS la route par défaut du worker vers egress-gateway, puis
   # s'arrête. Partage le netns du worker (network_mode) : NET_ADMIN reste sur

@@ -26,6 +26,40 @@ que ce que cette passerelle autorise explicitement. Voir
 - **Tout le reste** (autre port/protocole) : bloqué par nftables
   (chaîne `forward`, `policy drop` + règle terminale loggée via ulogd).
 
+## Piège worker-netinit (route par défaut perdue après un rebuild)
+
+`worker-netinit` est un service jetable (`restart: "no"`) : il tourne une
+fois, pose `ip route replace default via 10.90.0.2` dans le netns du worker,
+puis s'arrête. Il ne se relance **pas automatiquement** juste parce que le
+conteneur `worker` est recréé (rebuild d'image, `docker compose up -d --build
+worker` ciblé, etc.) — un `network_mode: "service:worker"` s'attache au netns
+du worker *actuel* à son propre démarrage, pas en continu.
+
+Symptôme si la route manque : un job réseau (httpx, subfinder) ressort
+`status: done`, `exit_code: 0`, mais **`stdout` vide** — aucune exception,
+aucun log d'erreur, car `network is unreachable` est avalé silencieusement
+par l'outil. Aucun asset n'est jamais persisté, mais rien ne le signale côté
+job. C'est un piège vécu en pratique (voir historique de
+`app/wrappers/httpx.py`), pas hypothétique.
+
+Deux filets contre ça :
+1. Le worker attend lui-même sa route par défaut avant de laisser tourner
+   arq (`gateway/scripts/wait_for_egress_route.py`, appelé par le `command`
+   du service `worker` dans docker-compose.yml) — si `worker-netinit` n'a
+   jamais tourné ou a échoué, arq ne démarre jamais et le conteneur
+   s'arrête (visible dans `docker compose ps`), plutôt que de traiter des
+   jobs qui échoueront tous en silence.
+2. Si vous recréez le worker manuellement en ciblant seulement ce service
+   (au lieu de `docker compose up -d` sur toute la stack), relancez aussi
+   explicitement :
+   ```
+   docker compose up -d worker-netinit
+   ```
+   Vérification rapide de la route :
+   ```
+   docker compose exec worker sh -c "grep -c ' 00000000 ' /proc/net/route" # doit être 1
+   ```
+
 ## Fournir la politique (allowlist)
 
 Un fichier par politique, un nom d'hôte par ligne, `#` pour commentaire.

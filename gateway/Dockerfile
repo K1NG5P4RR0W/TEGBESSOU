@@ -59,5 +59,11 @@ RUN python3 /tmp/install_httpx.py && rm /tmp/install_httpx.py
 # aucune donnée — juste un fichier qui doit exister.
 COPY subfinder/config.yaml /etc/subfinder/config.yaml
 
+# Attend que `worker-netinit` (docker-compose.yml) ait posé la route par
+# défaut vers le sas d'egress avant de laisser arq traiter le moindre job —
+# voir scripts/wait_for_egress_route.py pour le pourquoi (sinon : jobs
+# réseau qui échouent en silence, stdout vide, exit 0).
+COPY scripts/wait_for_egress_route.py /app/scripts/wait_for_egress_route.py
+
 USER appuser
-CMD ["arq", "app.worker.WorkerSettings"]
+CMD ["sh", "-c", "python3 /app/scripts/wait_for_egress_route.py && exec arq app.worker.WorkerSettings"]

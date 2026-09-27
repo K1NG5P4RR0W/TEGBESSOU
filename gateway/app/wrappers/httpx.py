@@ -68,9 +68,11 @@ class HttpxWrapper(ToolWrapper):
         # sans ça httpx retente ~30s dans le vide avant d'être tué par le
         # timeout du job (cf. egress-gateway/README.md, § httpx à travers le sas).
         args += ["-timeout", str(self.timeout), "-retries", str(self.retries)]
-        # Expose les en-têtes de réponse dans le JSON (champ `raw_header`,
-        # cf. httpx v1.12.0 runner/types.go) pour que `parse` puisse détecter
-        # X-Egress-Denied et écarter le refus du sas.
+        # Expose les en-têtes de réponse dans le JSON (champ `header`, un
+        # objet clé/valeur normalisé — PAS `raw_header`, qui n'existe pas
+        # dans le JSON de httpx v1.12.0, cf. runner/types.go) pour que
+        # `parse` puisse détecter X-Egress-Denied (clé `x_egress_denied`) et
+        # écarter le refus du sas.
         args.append("-include-response-header")
         return args
 
@@ -79,13 +81,16 @@ class HttpxWrapper(ToolWrapper):
         """Écarte une réponse qui est en fait le refus du sas d'egress, jamais
         une vraie réponse de la cible. Deux filets indépendants (défense en
         profondeur, cf. egress-gateway/README.md) :
-        - primaire : en-tête `X-Egress-Denied` présent dans `raw_header` ;
+        - primaire : en-tête `X-Egress-Denied` présent dans l'objet `header`
+          (champ ajouté par `-include-response-header` ; httpx v1.12.0
+          l'expose sous la clé normalisée `x_egress_denied`, PAS dans un
+          champ `raw_header` — ce dernier n'existe pas dans cette version) ;
         - repli : signature exacte (webserver, status_code, content_length)
           de la page d'erreur 403 nue de nginx, au cas où l'en-tête n'aurait
           pas été émis ou capturé (flag oublié, autre chemin de refus…).
         """
-        raw_header = obj.get("raw_header")
-        if isinstance(raw_header, str) and "x-egress-denied" in raw_header.lower():
+        header = obj.get("header")
+        if isinstance(header, dict) and str(header.get("x_egress_denied", "")).strip():
             return True
         return (
             obj.get("webserver") == _SAS_DENIAL_WEBSERVER
